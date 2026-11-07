@@ -42,7 +42,13 @@ class MusicPlayer:
         loop = asyncio.get_running_loop()
         def _download():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(query, download=True)
+                # Agar direct URL nahi hai, toh ytsearch laga do
+                if not query.startswith("http"):
+                    q = f"ytsearch:{query}"
+                else:
+                    q = query
+                
+                info = ydl.extract_info(q, download=True)
                 if 'entries' in info:
                     info = info['entries'][0]
                 filename = ydl.prepare_filename(info)
