@@ -34,7 +34,8 @@ class MusicPlayer:
         ydl_opts = {
             'format': 'bestaudio/best',
             'noplaylist': True,
-            'quiet': True,
+            'quiet': False,
+            'username': 'oauth2',
             'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
             'outtmpl': 'downloads/%(id)s.%(ext)s',
         }
@@ -128,7 +129,6 @@ class MusicPlayer:
 
 player = MusicPlayer()
 
-# Command handler taaki bot commands ka jawab de aur gaane chala sake
 @bot_client.on_message(filters.command("play") & filters.group)
 async def play_command(client, message):
     if len(message.command) < 2:
