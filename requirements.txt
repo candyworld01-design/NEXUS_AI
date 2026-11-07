@@ -1,4 +1,4 @@
-ppyrogrammod==2.4.1
+pyrogrammod==2.4.1
 py-tgcalls==3.0.0
 flask==3.0.3
 yt-dlp==2026.10.26
