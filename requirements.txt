@@ -3,4 +3,5 @@ py-tgcalls==3.0.0
 flask==3.0.3
 yt-dlp==2026.10.26
 python-dotenv==1.0.1
-aiofiles==23.2.0
+aiofiles>=24.1.0
+
