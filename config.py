@@ -1,17 +1,10 @@
-FROM python:3.11-slim
+import os
+from dotenv import load_dotenv
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+load_dotenv()
 
-WORKDIR /app
+API_ID = int(os.getenv("API_ID", 0))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+STRING_SESSION = os.getenv("STRING_SESSION", "")
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
-EXPOSE 8080
-
-CMD ["python", "main.py"]
