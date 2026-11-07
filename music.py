@@ -1,7 +1,7 @@
 import os
 import asyncio
-from pyrogram import Client
-from pytgcalls import PyTgCalls, filters
+from pyrogram import Client, filters
+from pytgcalls import PyTgCalls, filters as tg_filters
 from pytgcalls.types import StreamEnded
 from config import API_ID, API_HASH, STRING_SESSION, BOT_TOKEN
 from music_queue import queue
@@ -42,7 +42,6 @@ class MusicPlayer:
         loop = asyncio.get_running_loop()
         def _download():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Agar direct URL nahi hai, toh ytsearch laga do
                 if not query.startswith("http"):
                     q = f"ytsearch:{query}"
                 else:
@@ -128,7 +127,24 @@ class MusicPlayer:
 
 player = MusicPlayer()
 
-@call_py.on_update(filters.stream_end())
+# Command handler taaki bot commands ka jawab de aur gaane chala sake
+@bot_client.on_message(filters.command("play") & filters.group)
+async def play_command(client, message):
+    if len(message.command) < 2:
+        return await message.reply("❌ Please provide a song name! Example: `/play falak tak`")
+    
+    query = " ".join(message.command[1:])
+    m = await message.reply("🔍 Searching song...")
+    
+    try:
+        file_path, title = await player.search_and_download(query)
+        await m.edit("🎵 Downloading & starting...")
+        _, msg = await player.add_and_play(message.chat.id, file_path, title)
+        await m.edit(msg)
+    except Exception as e:
+        await m.edit(f"❌ Error: `{e}`")
+
+@call_py.on_update(tg_filters.stream_end())
 async def on_stream_end_handler(client, update: StreamEnded):
     chat_id = update.chat_id
     async with player.lock:
