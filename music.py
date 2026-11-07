@@ -35,6 +35,7 @@ class MusicPlayer:
             'format': 'bestaudio/best',
             'noplaylist': True,
             'quiet': True,
+            'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
             'outtmpl': 'downloads/%(id)s.%(ext)s',
         }
         os.makedirs("downloads", exist_ok=True)
