@@ -7,13 +7,18 @@ from pyrogram import Client, filters, idle
 from pytgcalls import PyTgCalls, filters as tg_filters
 from pytgcalls.types import StreamEnded
 
-# Environment variables
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-STRING_SESSION = os.getenv("STRING_SESSION", "")
+# Environment variables with safety check
+API_ID_RAW = os.getenv("API_ID", "").strip()
+API_HASH = os.getenv("API_HASH", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
 
-# Flask keep-alive server for Render (Port binding mandatory)
+if not API_ID_RAW or not API_HASH or not BOT_TOKEN or not STRING_SESSION:
+    print("❌ CRITICAL ERROR: Missing one or more environment variables (API_ID, API_HASH, BOT_TOKEN, STRING_SESSION)!")
+
+API_ID = int(API_ID_RAW) if API_ID_RAW.isdigit() else 0
+
+# Flask keep-alive server for Render
 app = Flask(__name__)
 
 @app.route('/')
@@ -45,6 +50,7 @@ class SongQueue:
 
 queue = SongQueue()
 
+# Clients initialization with explicit credentials passed directly
 bot_client = Client(
     "NexusBot",
     api_id=API_ID,
@@ -162,16 +168,17 @@ async def on_stream_end_handler(client, update: StreamEnded):
     await player.play_next(chat_id, expected_gen=current_gen)
 
 async def main():
-    # Start Flask web server in background thread so Render keeps the service alive
+    # Start Flask web server in background thread
     threading.Thread(target=run_flask, daemon=True).start()
     print("🌐 Flask keep-alive server started.")
 
+    print("🎙️ Starting PyTgCalls (Assistant)...")
     await call_py.start()
-    print("🎙️ PyTgCalls started.")
     
+    print("🤖 Starting Telegram Bot Client...")
     await bot_client.start()
-    print("🤖 Telegram Bot started successfully!")
     
+    print("🎉 Bot is fully running and active!")
     await idle()
 
 if __name__ == "__main__":
