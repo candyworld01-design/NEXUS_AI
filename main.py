@@ -1,22 +1,60 @@
 import os
 import asyncio
+import threading
 import aiohttp
-from pyrogram import Client, filters
+from flask import Flask
+from pyrogram import Client, filters, idle
 from pytgcalls import PyTgCalls, filters as tg_filters
 from pytgcalls.types import StreamEnded
-from config import API_ID, API_HASH, STRING_SESSION, BOT_TOKEN
-from music_queue import queue
+
+# Environment variables
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+STRING_SESSION = os.getenv("STRING_SESSION", "")
+
+# Flask keep-alive server for Render (Port binding mandatory)
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return "Nexus Music Bot is Live!"
+
+def run_flask():
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+# Inline Song Queue Manager
+class SongQueue:
+    def __init__(self):
+        self.queue = []
+
+    async def add(self, item):
+        self.queue.append(item)
+
+    async def get_next(self):
+        if self.queue:
+            return self.queue.pop(0)
+        return None
+
+    async def get_size(self):
+        return len(self.queue)
+
+    async def clear(self):
+        self.queue.clear()
+
+queue = SongQueue()
 
 bot_client = Client(
     "NexusBot",
-    api_id=int(API_ID),
+    api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
 
 assistant_client = Client(
     "NexusAssistant",
-    api_id=int(API_ID),
+    api_id=API_ID,
     api_hash=API_HASH,
     session_string=STRING_SESSION
 )
@@ -31,7 +69,6 @@ class MusicPlayer:
         self.lock = asyncio.Lock()
 
     async def search_and_get_stream(self, query: str):
-        # JioSaavn API se direct gaana search karke streaming link nikalenge (No YouTube, No Cookies!)
         async with aiohttp.ClientSession() as session:
             url = f"https://saavn.dev/api/search/songs?query={query}"
             async with session.get(url) as resp:
@@ -44,7 +81,6 @@ class MusicPlayer:
                 
                 song = results[0]
                 title = song.get("name", "Unknown Title")
-                # 320kbps ya best download link uthayenge
                 download_url = None
                 for d in song.get("downloadUrl", []):
                     if d.get("quality") == "320kbps":
@@ -68,7 +104,6 @@ class MusicPlayer:
                 except Exception as e:
                     self.is_playing = False
                     self.current_chat_id = None
-                    print(f"Playback error: {e}")
                     raise e
             else:
                 await queue.add((stream_url, title))
@@ -85,7 +120,6 @@ class MusicPlayer:
                 stream_url, title = song
                 self.is_playing = True
                 self.current_chat_id = chat_id
-                track_gen = self.generation_id
                 try:
                     await call_py.play(chat_id, stream_url)
                     return title
@@ -99,17 +133,6 @@ class MusicPlayer:
                 except Exception:
                     pass
                 return None
-
-    async def stop(self, chat_id: int):
-        async with self.lock:
-            self.generation_id += 1
-            await queue.clear()
-            self.is_playing = False
-            self.current_chat_id = None
-            try:
-                await call_py.leave_call(chat_id)
-            except Exception:
-                pass
 
 player = MusicPlayer()
 
@@ -137,3 +160,19 @@ async def on_stream_end_handler(client, update: StreamEnded):
         current_gen = player.generation_id
     
     await player.play_next(chat_id, expected_gen=current_gen)
+
+async def main():
+    # Start Flask web server in background thread so Render keeps the service alive
+    threading.Thread(target=run_flask, daemon=True).start()
+    print("🌐 Flask keep-alive server started.")
+
+    await call_py.start()
+    print("🎙️ PyTgCalls started.")
+    
+    await bot_client.start()
+    print("🤖 Telegram Bot started successfully!")
+    
+    await idle()
+
+if __name__ == "__main__":
+    asyncio.get_event_loop().run_until_complete(main())
