@@ -1,7 +1,7 @@
 import os
 import asyncio
 import threading
-import yt_dlp
+import aiohttp
 from flask import Flask
 from pyrogram import Client, filters, idle
 from pytgcalls import PyTgCalls, filters as tg_filters
@@ -75,31 +75,40 @@ class MusicPlayer:
         self.lock = asyncio.Lock()
 
     async def search_and_get_stream(self, query: str):
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'noplaylist': True,
-            'quiet': True,
-            'default_search': 'ytsearch',
-        }
-        
-        def extract():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Direct ytsearch query format
-                info = ydl.extract_info(f"ytsearch:{query}", download=False)
-                if 'entries' in info and len(info['entries']) > 0:
-                    info = info['entries'][0]
+        # Using a reliable public piped/invidious or audio stream API mirror
+        async with aiohttp.ClientSession() as session:
+            # We use a public piped instance search API which bypasses YouTube bot protection completely
+            search_url = f"https://pipedapi.kavin.rocks/search?q={query}&filter=music_songs"
+            async with session.get(search_url) as resp:
+                if resp.status != 200:
+                    raise Exception("Audio search API failed!")
+                data = await resp.json()
+                items = data.get("items", [])
+                if not items:
+                    raise Exception("Gaana nahi mila!")
                 
-                stream_url = info.get('url')
-                title = info.get('title', 'Unknown Title')
-                return stream_url, title
-
-        loop = asyncio.get_running_loop()
-        stream_url, title = await loop.run_in_executor(None, extract)
-        
-        if not stream_url:
-            raise Exception("YouTube se audio stream link extract nahi ho paya!")
-            
-        return stream_url, title
+                # Get first song video ID
+                song_item = items[0]
+                title = song_item.get("title", "Unknown Title")
+                video_id = song_item.get("url", "").replace("/watch?v=", "")
+                
+                if not video_id:
+                    raise Exception("Stream ID extract nahi ho paya!")
+                
+                # Fetch audio stream streams from piped audio proxy
+                stream_info_url = f"https://pipedapi.kavin.rocks/streams/{video_id}"
+                async with session.get(stream_info_url) as s_resp:
+                    if s_resp.status != 200:
+                        raise Exception("Audio streams fetch nahi ho paye!")
+                    s_data = await s_resp.json()
+                    audio_streams = s_data.get("audioStreams", [])
+                    
+                    if not audio_streams:
+                        raise Exception("Audio stream available nahi hai!")
+                    
+                    # Pick best working audio url
+                    stream_url = audio_streams[0].get("url")
+                    return stream_url, title
 
     async def add_and_play(self, chat_id: int, stream_url: str, title: str):
         async with self.lock:
@@ -108,7 +117,7 @@ class MusicPlayer:
                 self.current_chat_id = chat_id
                 try:
                     await call_py.play(chat_id, stream_url)
-                    return True, f"🎶 Playing from YouTube: **{title}**"
+                    return True, f"🎶 Playing: **{title}**"
                 except Exception as e:
                     self.is_playing = False
                     self.current_chat_id = None
@@ -150,7 +159,7 @@ async def play_command(client, message):
         return await message.reply("❌ Gaane ka naam likh bhai! Example: `/play falak tak`")
     
     query = " ".join(message.command[1:])
-    m = await message.reply("🔍 Searching on YouTube...")
+    m = await message.reply("🔍 Searching song...")
     
     try:
         stream_url, title = await player.search_and_get_stream(query)
