@@ -97,8 +97,7 @@ async def play_music(client, message):
     query = " ".join(message.command[1:])
     m = await message.reply(f"🔎 Searching for **{query}**...")
 
-    # Optimized ydl_opts using Android player client to avoid EJS / format errors
-        ydl_opts = {
+    ydl_opts = {
         'format': 'bestaudio/best',
         'noplaylist': True,
         'cookiefile': cookies_file_path if cookies_content else None,
@@ -110,7 +109,6 @@ async def play_music(client, message):
             }
         },
     }
-
 
     search_query = f"ytsearch:{query}"
 
