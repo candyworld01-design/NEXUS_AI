@@ -4,9 +4,19 @@ import threading
 from flask import Flask
 from pyrogram import Client, filters
 from pytgcalls import PyTgCalls
-from pytgcalls.types.stream import AudioPiped
-
 import yt_dlp
+
+# --- FOOLPROOF IMPORT WRAPPER (Kabhi Error Nahi Aayega) ---
+try:
+    from pytgcalls.types.input_stream import AudioPiped
+except ImportError:
+    try:
+        from pytgcalls.types.stream import AudioPiped
+    except ImportError:
+        try:
+            from pytgcalls.types import AudioPiped
+        except ImportError:
+            from pytgcalls import AudioPiped
 
 # Flask app for UptimeRobot keep-alive
 app = Flask(__name__)
@@ -73,7 +83,7 @@ async def play_music(client, message):
         audio_url = song_info['url']
         title = song_info.get('title', 'Unknown Title')
         
-        # Join group call using stable v2 method
+        # Join group call
         await call_py.join_group_call(
             message.chat.id,
             AudioPiped(audio_url)
