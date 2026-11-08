@@ -27,7 +27,6 @@ for mod_name in candidate_modules:
         for t in target_names:
             if hasattr(mod, t):
                 AudioPiped = getattr(mod, t)
-                print(f"✅ Loaded {t} from {mod_name}")
                 break
         if AudioPiped:
             break
@@ -43,7 +42,6 @@ if not AudioPiped:
                 for t in target_names:
                     if hasattr(m, t):
                         AudioPiped = getattr(m, t)
-                        print(f"✅ Loaded {t} via walk from {name}")
                         break
                 if AudioPiped:
                     break
@@ -97,11 +95,14 @@ async def play_music(client, message):
     query = " ".join(message.command[1:])
     m = await message.reply(f"🔎 Searching for **{query}**...")
 
+    # Updated ydl_opts with bypass options and cookiefile
     ydl_opts = {
         'format': 'bestaudio/best',
         'noplaylist': True,
         'cookiefile': cookies_file_path if cookies_content else None,
         'quiet': True,
+        'no_warnings': True,
+        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
     }
 
     search_query = f"ytsearch:{query}"
@@ -122,7 +123,6 @@ async def play_music(client, message):
         
         audio_stream = AudioPiped(audio_url)
         
-        # Version-agnostic call method handler
         try:
             if hasattr(call_py, 'play'):
                 await call_py.play(message.chat.id, audio_stream)
