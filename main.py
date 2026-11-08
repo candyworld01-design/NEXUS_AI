@@ -27,6 +27,7 @@ for mod_name in candidate_modules:
         for t in target_names:
             if hasattr(mod, t):
                 AudioPiped = getattr(mod, t)
+                print(f"✅ Loaded {t} from {mod_name}")
                 break
         if AudioPiped:
             break
@@ -42,6 +43,7 @@ if not AudioPiped:
                 for t in target_names:
                     if hasattr(m, t):
                         AudioPiped = getattr(m, t)
+                        print(f"✅ Loaded {t} via walk from {name}")
                         break
                 if AudioPiped:
                     break
@@ -95,14 +97,18 @@ async def play_music(client, message):
     query = " ".join(message.command[1:])
     m = await message.reply(f"🔎 Searching for **{query}**...")
 
-    # Updated ydl_opts with bypass options and cookiefile
+    # Optimized ydl_opts using Android player client to avoid EJS / format errors
     ydl_opts = {
         'format': 'bestaudio/best',
         'noplaylist': True,
         'cookiefile': cookies_file_path if cookies_content else None,
         'quiet': True,
         'no_warnings': True,
-        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android']
+            }
+        },
     }
 
     search_query = f"ytsearch:{query}"
@@ -131,10 +137,16 @@ async def play_music(client, message):
         except Exception:
             await call_py.join_group_call(message.chat.id, audio_stream)
 
-        await m.edit(f"🎵 Now playing: **{title}**")
+        try:
+            await m.edit(f"🎵 Now playing: **{title}**")
+        except Exception:
+            pass
         
     except Exception as e:
-        await m.edit(f"❌ Error: {str(e)}")
+        try:
+            await m.edit(f"❌ Error: {str(e)}")
+        except Exception:
+            pass
 
 async def main():
     threading.Thread(target=run_flask, daemon=True).start()
