@@ -1,22 +1,59 @@
 import os
 import asyncio
 import threading
+import pkgutil
 from flask import Flask
 from pyrogram import Client, filters
 from pytgcalls import PyTgCalls
+import pytgcalls
 import yt_dlp
 
-# --- FOOLPROOF IMPORT WRAPPER (Kabhi Error Nahi Aayega) ---
-try:
-    from pytgcalls.types.input_stream import AudioPiped
-except ImportError:
+# --- FOOLPROOF DYNAMIC IMPORT AUTO-DISCOVERER ---
+AudioPiped = None
+target_names = ['AudioPiped', 'InputStream', 'AudioStream', 'AudioVideoPiped']
+
+candidate_modules = [
+    'pytgcalls.types.input.audio_piped',
+    'pytgcalls.types.input',
+    'pytgcalls.types.stream',
+    'pytgcalls.types.input_stream',
+    'pytgcalls.types',
+    'pytgcalls'
+]
+
+for mod_name in candidate_modules:
     try:
-        from pytgcalls.types.stream import AudioPiped
-    except ImportError:
-        try:
-            from pytgcalls.types import AudioPiped
-        except ImportError:
-            from pytgcalls import AudioPiped
+        mod = __import__(mod_name, fromlist=target_names)
+        for t in target_names:
+            if hasattr(mod, t):
+                AudioPiped = getattr(mod, t)
+                print(f"✅ Loaded {t} from {mod_name}")
+                break
+        if AudioPiped:
+            break
+    except Exception:
+        pass
+
+if not AudioPiped:
+    try:
+        import pytgcalls.types
+        for _, name, _ in pkgutil.walk_packages(pytgcalls.types.__path__, 'pytgcalls.types.'):
+            try:
+                m = __import__(name, fromlist=target_names)
+                for t in target_names:
+                    if hasattr(m, t):
+                        AudioPiped = getattr(m, t)
+                        print(f"✅ Loaded {t} via walk from {name}")
+                        break
+                if AudioPiped:
+                    break
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+if not AudioPiped:
+    raise ImportError("Could not automatically locate AudioPiped in installed pytgcalls version.")
 
 # Flask app for UptimeRobot keep-alive
 app = Flask(__name__)
@@ -83,18 +120,23 @@ async def play_music(client, message):
         audio_url = song_info['url']
         title = song_info.get('title', 'Unknown Title')
         
-        # Join group call
-        await call_py.join_group_call(
-            message.chat.id,
-            AudioPiped(audio_url)
-        )
+        audio_stream = AudioPiped(audio_url)
+        
+        # Version-agnostic call method handler
+        try:
+            if hasattr(call_py, 'play'):
+                await call_py.play(message.chat.id, audio_stream)
+            else:
+                await call_py.join_group_call(message.chat.id, audio_stream)
+        except Exception:
+            await call_py.join_group_call(message.chat.id, audio_stream)
+
         await m.edit(f"🎵 Now playing: **{title}**")
         
     except Exception as e:
         await m.edit(f"❌ Error: {str(e)}")
 
 async def main():
-    # Start Flask keep-alive server in background
     threading.Thread(target=run_flask, daemon=True).start()
     
     print("🤖 Starting Telegram Bot...")
