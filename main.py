@@ -3,7 +3,8 @@ import asyncio
 from flask import Flask
 from pyrogram import Client, filters
 from pytgcalls import PyTgCalls
-from pytgcalls import AudioPiped
+from pytgcalls.types import AudioPiped
+
 
 
 
