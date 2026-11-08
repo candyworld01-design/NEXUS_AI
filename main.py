@@ -4,7 +4,7 @@ import threading
 from flask import Flask
 from pyrogram import Client, filters
 from pytgcalls import PyTgCalls
-from pytgcalls.types.input_stream import AudioPiped
+from pytgcalls.types.input import AudioPiped
 import yt_dlp
 
 # Flask app for UptimeRobot keep-alive
