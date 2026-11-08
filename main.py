@@ -26,7 +26,7 @@ def index():
     return "Nexus Music Bot is Live!"
 
 def run_flask():
-    port = int(os.getenv("PORT", 10000))
+    port = int(os.getenv("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
 # Inline Song Queue Manager
@@ -50,7 +50,7 @@ class SongQueue:
 
 queue = SongQueue()
 
-# Clients initialization with explicit credentials passed directly
+# Clients initialization
 bot_client = Client(
     "NexusBot",
     api_id=API_ID,
@@ -76,10 +76,11 @@ class MusicPlayer:
 
     async def search_and_get_stream(self, query: str):
         async with aiohttp.ClientSession() as session:
-            url = f"https://saavn.dev/api/search/songs?query={query}"
+            # Updated to working public API endpoint
+            url = f"https://saavn.me/search/songs?query={query}"
             async with session.get(url) as resp:
                 if resp.status != 200:
-                    raise Exception("Failed to fetch song from JioSaavn")
+                    raise Exception("Failed to fetch song from JioSaavn API")
                 data = await resp.json()
                 results = data.get("data", {}).get("results", [])
                 if not results:
@@ -88,11 +89,13 @@ class MusicPlayer:
                 song = results[0]
                 title = song.get("name", "Unknown Title")
                 download_url = None
-                for d in song.get("downloadUrl", []):
+                
+                download_urls = song.get("downloadUrl", [])
+                for d in download_urls:
                     if d.get("quality") == "320kbps":
                         download_url = d.get("url")
-                if not download_url and song.get("downloadUrl"):
-                    download_url = song.get("downloadUrl")[-1].get("url")
+                if not download_url and download_urls:
+                    download_url = download_urls[-1].get("url")
                 
                 if not download_url:
                     raise Exception("Audio stream link not available!")
