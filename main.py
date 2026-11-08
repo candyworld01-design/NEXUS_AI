@@ -1,20 +1,20 @@
 import os
 import asyncio
 import threading
-import aiohttp
+import yt_dlp
 from flask import Flask
 from pyrogram import Client, filters, idle
 from pytgcalls import PyTgCalls, filters as tg_filters
 from pytgcalls.types import StreamEnded
 
-# Environment variables with safety check
+# Environment variables
 API_ID_RAW = os.getenv("API_ID", "").strip()
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
 
 if not API_ID_RAW or not API_HASH or not BOT_TOKEN or not STRING_SESSION:
-    print("❌ CRITICAL ERROR: Missing one or more environment variables (API_ID, API_HASH, BOT_TOKEN, STRING_SESSION)!")
+    print("❌ CRITICAL ERROR: Missing environment variables!")
 
 API_ID = int(API_ID_RAW) if API_ID_RAW.isdigit() else 0
 
@@ -29,7 +29,7 @@ def run_flask():
     port = int(os.getenv("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
-# Inline Song Queue Manager
+# Song Queue Manager
 class SongQueue:
     def __init__(self):
         self.queue = []
@@ -75,32 +75,31 @@ class MusicPlayer:
         self.lock = asyncio.Lock()
 
     async def search_and_get_stream(self, query: str):
-        async with aiohttp.ClientSession() as session:
-            # Updated to working public API endpoint
-            url = f"https://saavn.me/search/songs?query={query}"
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    raise Exception("Failed to fetch song from JioSaavn API")
-                data = await resp.json()
-                results = data.get("data", {}).get("results", [])
-                if not results:
-                    raise Exception("Song not found on JioSaavn!")
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'noplaylist': True,
+            'quiet': True,
+            'default_search': 'ytsearch',
+        }
+        
+        def extract():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # Direct ytsearch query format
+                info = ydl.extract_info(f"ytsearch:{query}", download=False)
+                if 'entries' in info and len(info['entries']) > 0:
+                    info = info['entries'][0]
                 
-                song = results[0]
-                title = song.get("name", "Unknown Title")
-                download_url = None
-                
-                download_urls = song.get("downloadUrl", [])
-                for d in download_urls:
-                    if d.get("quality") == "320kbps":
-                        download_url = d.get("url")
-                if not download_url and download_urls:
-                    download_url = download_urls[-1].get("url")
-                
-                if not download_url:
-                    raise Exception("Audio stream link not available!")
-                
-                return download_url, title
+                stream_url = info.get('url')
+                title = info.get('title', 'Unknown Title')
+                return stream_url, title
+
+        loop = asyncio.get_running_loop()
+        stream_url, title = await loop.run_in_executor(None, extract)
+        
+        if not stream_url:
+            raise Exception("YouTube se audio stream link extract nahi ho paya!")
+            
+        return stream_url, title
 
     async def add_and_play(self, chat_id: int, stream_url: str, title: str):
         async with self.lock:
@@ -109,7 +108,7 @@ class MusicPlayer:
                 self.current_chat_id = chat_id
                 try:
                     await call_py.play(chat_id, stream_url)
-                    return True, f"🎶 Playing from JioSaavn: **{title}**"
+                    return True, f"🎶 Playing from YouTube: **{title}**"
                 except Exception as e:
                     self.is_playing = False
                     self.current_chat_id = None
@@ -151,7 +150,7 @@ async def play_command(client, message):
         return await message.reply("❌ Gaane ka naam likh bhai! Example: `/play falak tak`")
     
     query = " ".join(message.command[1:])
-    m = await message.reply("🔍 Searching on JioSaavn...")
+    m = await message.reply("🔍 Searching on YouTube...")
     
     try:
         stream_url, title = await player.search_and_get_stream(query)
@@ -171,7 +170,6 @@ async def on_stream_end_handler(client, update: StreamEnded):
     await player.play_next(chat_id, expected_gen=current_gen)
 
 async def main():
-    # Start Flask web server in background thread
     threading.Thread(target=run_flask, daemon=True).start()
     print("🌐 Flask keep-alive server started.")
 
