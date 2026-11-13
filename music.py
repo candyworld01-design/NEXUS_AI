@@ -20,14 +20,12 @@ from config import (
 from music_queue import queue
 
 
-logging.basicConfig(level=logging.INFO)
-
 logger = logging.getLogger(__name__)
 
 
-# ==============================
+# =================================
 # TELEGRAM CLIENTS
-# ==============================
+# =================================
 
 bot_client = Client(
     "NexusBot",
@@ -45,16 +43,16 @@ assistant_client = Client(
 )
 
 
-# ==============================
+# =================================
 # PYTGCALLS
-# ==============================
+# =================================
 
-call_py = PyTgCalls(assistant_client)
+call_py = None
 
 
-# ==============================
+# =================================
 # DOWNLOAD SETTINGS
-# ==============================
+# =================================
 
 DOWNLOAD_DIR = "/tmp/nexus_downloads"
 
@@ -78,7 +76,10 @@ def get_ydl_options():
         ),
     }
 
-    cookies = os.getenv("YOUTUBE_COOKIES", "").strip()
+    cookies = os.getenv(
+        "YOUTUBE_COOKIES",
+        ""
+    ).strip()
 
     if cookies:
 
@@ -99,9 +100,9 @@ def get_ydl_options():
     return options
 
 
-# ==============================
+# =================================
 # MUSIC PLAYER
-# ==============================
+# =================================
 
 class MusicPlayer:
 
@@ -117,12 +118,15 @@ class MusicPlayer:
 
         self.generation_id = 0
 
+        self.lock = None
+
+    def initialize_lock(self):
+
         self.lock = asyncio.Lock()
 
-
-    # --------------------------
+    # --------------------------------
     # SEARCH AND DOWNLOAD
-    # --------------------------
+    # --------------------------------
 
     async def search_and_download(self, query):
 
@@ -134,7 +138,9 @@ class MusicPlayer:
 
             with yt_dlp.YoutubeDL(options) as ydl:
 
-                if query.startswith("http://") or query.startswith("https://"):
+                if query.startswith(
+                    ("http://", "https://")
+                ):
                     search = query
                 else:
                     search = f"ytsearch1:{query}"
@@ -146,7 +152,7 @@ class MusicPlayer:
 
                 if not info:
                     raise RuntimeError(
-                        "No video information received from YouTube."
+                        "No video information received."
                     )
 
                 if "entries" in info:
@@ -180,12 +186,16 @@ class MusicPlayer:
             download
         )
 
-
-    # --------------------------
+    # --------------------------------
     # PLAY FILE
-    # --------------------------
+    # --------------------------------
 
     async def play_file(self, chat_id, file_path):
+
+        if call_py is None:
+            raise RuntimeError(
+                "PyTgCalls is not initialized."
+            )
 
         stream = MediaStream(
             file_path,
@@ -197,10 +207,9 @@ class MusicPlayer:
             stream
         )
 
-
-    # --------------------------
+    # --------------------------------
     # ADD AND PLAY
-    # --------------------------
+    # --------------------------------
 
     async def add_and_play(
         self,
@@ -227,7 +236,8 @@ class MusicPlayer:
 
                 return (
                     False,
-                    f"➕ Added to queue. Position: {position}\n🎵 {title}"
+                    f"➕ Added to queue. Position: {position}\n"
+                    f"🎵 {title}"
                 )
 
             self.is_playing = True
@@ -262,10 +272,9 @@ class MusicPlayer:
 
                 raise
 
-
-    # --------------------------
+    # --------------------------------
     # NEXT SONG
-    # --------------------------
+    # --------------------------------
 
     async def play_next(
         self,
@@ -356,10 +365,9 @@ class MusicPlayer:
                     "Could not leave voice chat"
                 )
 
-
-    # --------------------------
+    # --------------------------------
     # STOP MUSIC
-    # --------------------------
+    # --------------------------------
 
     async def stop(self, chat_id):
 
@@ -410,9 +418,35 @@ class MusicPlayer:
 player = MusicPlayer()
 
 
-# ==============================
+# =================================
+# INITIALIZE RUNTIME
+# =================================
+
+def initialize_runtime():
+
+    global call_py
+
+    # All loop-bound objects are created
+    # inside main()'s running event loop.
+
+    player.initialize_lock()
+
+    queue.initialize_lock()
+
+    call_py = PyTgCalls(
+        assistant_client
+    )
+
+    register_stream_handler()
+
+    logger.info(
+        "Music runtime initialized successfully."
+    )
+
+
+# =================================
 # PLAY COMMAND
-# ==============================
+# =================================
 
 @bot_client.on_message(
     filters.command("play") & filters.group
@@ -422,7 +456,8 @@ async def play_command(client, message):
     if len(message.command) < 2:
 
         return await message.reply(
-            "❌ Song name likho.\nExample: /play falak tak"
+            "❌ Song name likho.\n"
+            "Example: /play falak tak"
         )
 
     query = " ".join(
@@ -471,9 +506,9 @@ async def play_command(client, message):
         )
 
 
-# ==============================
+# =================================
 # STOP COMMAND
-# ==============================
+# =================================
 
 @bot_client.on_message(
     filters.command("stop") & filters.group
@@ -498,31 +533,38 @@ async def stop_command(client, message):
     )
 
 
-# ==============================
+# =================================
 # STREAM END HANDLER
-# ==============================
+# =================================
 
-@call_py.on_update(
-    tg_filters.stream_end()
-)
-async def stream_end_handler(client, update: StreamEnded):
+def register_stream_handler():
 
-    chat_id = update.chat_id
-
-    async with player.lock:
-
-        if not player.is_playing:
-            return
-
-        if player.current_chat_id != chat_id:
-            return
-
-        current_gen = player.generation_id
-
-    await player.play_next(
-        chat_id,
-        expected_gen=current_gen
+    @call_py.on_update(
+        tg_filters.stream_end()
     )
+    async def stream_end_handler(
+        client,
+        update: StreamEnded
+    ):
+
+        chat_id = update.chat_id
+
+        async with player.lock:
+
+            if not player.is_playing:
+                return
+
+            if player.current_chat_id != chat_id:
+                return
+
+            current_gen = player.generation_id
+
+        await player.play_next(
+            chat_id,
+            expected_gen=current_gen
+        )
 
 
-logger.info("Music module loaded successfully.")
+logger.info(
+    "Music module loaded successfully."
+)
