@@ -5,12 +5,8 @@ import logging
 from flask import Flask
 from pyrogram.errors import FloodWait
 
+import music
 from config import PORT
-from music import (
-    bot_client,
-    assistant_client,
-    call_py
-)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -44,17 +40,21 @@ async def start_client(client, name):
 
     while True:
         try:
-            logger.info(f"Starting {name}...")
+            logger.info("Starting %s...", name)
+
             await client.start()
-            logger.info(f"{name} started successfully!")
+
+            logger.info("%s started successfully!", name)
             return
 
         except FloodWait as e:
+
             wait_time = int(e.value) + 5
 
             logger.warning(
-                f"{name}: Telegram FloodWait. "
-                f"Waiting {wait_time} seconds."
+                "%s: FloodWait. Waiting %s seconds.",
+                name,
+                wait_time
             )
 
             await asyncio.sleep(wait_time)
@@ -67,16 +67,26 @@ async def main():
         daemon=True
     ).start()
 
-    await start_client(bot_client, "Telegram Bot")
-
+    # Start Telegram bot
     await start_client(
-        assistant_client,
+        music.bot_client,
+        "Telegram Bot"
+    )
+
+    # Start assistant account
+    await start_client(
+        music.assistant_client,
         "Assistant Account"
     )
 
+    # Initialize everything inside the SAME event loop
+    logger.info("Initializing music runtime...")
+
+    music.initialize_runtime()
+
     logger.info("Starting PyTgCalls...")
 
-    await call_py.start()
+    await music.call_py.start()
 
     logger.info("PyTgCalls started successfully!")
     logger.info("NEXUS Music is Running!")
@@ -85,4 +95,5 @@ async def main():
 
 
 if __name__ == "__main__":
+
     asyncio.run(main())
