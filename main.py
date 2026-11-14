@@ -1,99 +1,48 @@
 import asyncio
-import threading
 import logging
 
-from flask import Flask
+import music
+import health
 from pyrogram.errors import FloodWait
 
-import music
-from config import PORT
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-app = Flask(__name__)
-
-
-@app.route("/")
-def home():
-    return "NEXUS Music Bot is Online!", 200
-
-
-@app.route("/health")
-def health():
-    return {
-        "status": "healthy",
-        "bot": "running"
-    }, 200
-
-
-def run_web_server():
-    app.run(
-        host="0.0.0.0",
-        port=PORT,
-        debug=False,
-        use_reloader=False
-    )
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("nexus")
 
 
 async def start_client(client, name):
-
     while True:
         try:
             logger.info("Starting %s...", name)
-
             await client.start()
-
-            logger.info("%s started successfully!", name)
+            logger.info("%s started.", name)
             return
-
-        except FloodWait as e:
-
-            wait_time = int(e.value) + 5
-
-            logger.warning(
-                "%s: FloodWait. Waiting %s seconds.",
-                name,
-                wait_time
-            )
-
-            await asyncio.sleep(wait_time)
+        except FloodWait as exc:
+            delay = int(exc.value) + 5
+            logger.warning("%s FloodWait: sleeping %s seconds", name, delay)
+            await asyncio.sleep(delay)
 
 
 async def main():
+    health.start_health_server()
 
-    threading.Thread(
-        target=run_web_server,
-        daemon=True
-    ).start()
+    await start_client(music.bot_client, "Telegram bot")
+    health.set_component("bot_active", True)
 
-    # Start Telegram bot
-    await start_client(
-        music.bot_client,
-        "Telegram Bot"
-    )
-
-    # Start assistant account
-    await start_client(
-        music.assistant_client,
-        "Assistant Account"
-    )
-
-    # Initialize everything inside the SAME event loop
-    logger.info("Initializing music runtime...")
+    await start_client(music.assistant_client, "Assistant account")
+    health.set_component("assistant_active", True)
 
     music.initialize_runtime()
 
     logger.info("Starting PyTgCalls...")
-
     await music.call_py.start()
+    health.set_component("pytgcalls_active", True)
 
-    logger.info("PyTgCalls started successfully!")
-    logger.info("NEXUS Music is Running!")
-
+    logger.info("NEXUS Music 2.0 is online.")
     await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-
     asyncio.run(main())
