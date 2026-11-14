@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import time
+import urllib.request
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -45,8 +46,8 @@ def ydl_options():
         "retries": 2,
         "fragment_retries": 2,
         "extractor_retries": 2,
-        "socket_timeout": 20,
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
+        "socket_timeout": 15,
+        "skip_download": True,
     }
     cookies = os.getenv("YOUTUBE_COOKIES", "").strip()
     if cookies:
@@ -57,29 +58,31 @@ def ydl_options():
     return options
 
 
-def _download_sync(query):
+def _first_entry(info):
+    if not info:
+        raise RuntimeError("No search result was returned.")
+    if "entries" in info:
+        entries = [item for item in (info.get("entries") or []) if item]
+        if not entries:
+            raise RuntimeError("No song found for that search.")
+        return entries[0]
+    return info
+
+
+def _extract_info_sync(query):
     with yt_dlp.YoutubeDL(ydl_options()) as ydl:
         target = query if query.startswith(("http://", "https://")) else f"ytsearch1:{query}"
-        info = ydl.extract_info(target, download=True)
-        if not info:
-            raise RuntimeError("No search result was returned.")
-        if "entries" in info:
-            entries = [item for item in (info.get("entries") or []) if item]
-            if not entries:
-                raise RuntimeError("No song found for that search.")
-            info = entries[0]
-        downloads = info.get("requested_downloads") or []
-        path = (downloads[0].get("filepath") if downloads else None) or ydl.prepare_filename(info)
-        if not os.path.isfile(path):
-            # yt-dlp can append a postprocessor extension; find the matching ID file.
-            vid = info.get("id", "")
-            matches = [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR)
-                       if vid and f.startswith(vid + ".")]
-            path = matches[0] if matches else path
-        if not os.path.isfile(path):
-            raise RuntimeError("Downloaded audio file was not found.")
+        info = _first_entry(ydl.extract_info(target, download=False))
+        stream_url = info.get("url")
+        if not stream_url:
+            formats = [f for f in (info.get("formats") or []) if f.get("url") and f.get("acodec") != "none"]
+            if not formats:
+                raise RuntimeError("No playable audio stream was found.")
+            stream_url = formats[-1]["url"]
         return {
-            "file": path,
+            "file": None,
+            "stream_url": stream_url,
+            "http_headers": info.get("http_headers") or {},
             "title": info.get("title") or "Unknown title",
             "duration": int(info.get("duration") or 0),
             "url": info.get("webpage_url") or query,
@@ -89,12 +92,56 @@ def _download_sync(query):
         }
 
 
+def _refresh_stream_sync(webpage_url):
+    """Resolve a fresh expiring media URL immediately before playback."""
+    with yt_dlp.YoutubeDL(ydl_options()) as ydl:
+        info = _first_entry(ydl.extract_info(webpage_url, download=False))
+        stream_url = info.get("url")
+        if not stream_url:
+            formats = [f for f in (info.get("formats") or []) if f.get("url") and f.get("acodec") != "none"]
+            if not formats:
+                raise RuntimeError("Could not refresh the audio stream URL.")
+            stream_url = formats[-1]["url"]
+        return stream_url
+
+
 async def search_and_download(query, requester):
     loop = asyncio.get_running_loop()
-    song = await loop.run_in_executor(executor, _download_sync, query)
+    song = await loop.run_in_executor(executor, _extract_info_sync, query)
     song["requester"] = requester
     song["added_at"] = time.time()
     return song
+
+
+def _download_thumbnail_sync(url, video_id):
+    if not url:
+        return None
+    path = os.path.join(DOWNLOAD_DIR, f"{video_id or 'nexus'}_thumb.jpg")
+    if os.path.isfile(path) and os.path.getsize(path) > 1000:
+        return path
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            data = response.read(5 * 1024 * 1024)
+        if len(data) < 1000:
+            return None
+        with open(path, "wb") as fp:
+            fp.write(data)
+        return path
+    except Exception:
+        logger.warning("Thumbnail download failed", exc_info=True)
+        return None
+
+
+async def get_thumbnail_file(song):
+    existing = song.get("thumbnail_file")
+    if existing and os.path.isfile(existing):
+        return existing
+    loop = asyncio.get_running_loop()
+    video_id = str(song.get("url", "")).rstrip("/").split("=")[-1][:80]
+    path = await loop.run_in_executor(executor, _download_thumbnail_sync, song.get("thumbnail"), video_id)
+    song["thumbnail_file"] = path
+    return path
 
 
 def fmt_time(seconds):
@@ -167,11 +214,12 @@ class PlayerManager:
         return await search_and_download(query, requester)
 
     async def play_song(self, state, song):
-        if not os.path.isfile(song["file"]):
-            raise RuntimeError("Audio file is missing.")
+        loop = asyncio.get_running_loop()
+        stream_url = await loop.run_in_executor(executor, _refresh_stream_sync, song["url"])
+        song["stream_url"] = stream_url
         await call_py.play(
             state.chat_id,
-            MediaStream(song["file"], video_flags=MediaStream.Flags.IGNORE),
+            MediaStream(stream_url, video_flags=MediaStream.Flags.IGNORE),
         )
         state.current = song
         state.paused = False
@@ -269,11 +317,15 @@ class PlayerManager:
 
 
 def delete_song_file(song):
-    if song and song.get("file") and os.path.isfile(song["file"]):
-        try:
-            os.remove(song["file"])
-        except OSError:
-            pass
+    if not song:
+        return
+    for key in ("file", "thumbnail_file"):
+        path = song.get(key)
+        if path and os.path.isfile(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 manager = PlayerManager()
@@ -312,13 +364,15 @@ async def reply_now_playing(message, state, text=None):
     thumbnail = song.get("thumbnail")
     if thumbnail:
         try:
-            return await message.reply_photo(
-                photo=thumbnail,
-                caption=caption,
-                reply_markup=controls_keyboard(message.chat.id),
-            )
+            local_thumbnail = await get_thumbnail_file(song)
+            if local_thumbnail:
+                return await message.reply_photo(
+                    photo=local_thumbnail,
+                    caption=caption,
+                    reply_markup=controls_keyboard(message.chat.id),
+                )
         except Exception:
-            logger.warning("Thumbnail could not be sent; falling back to text player.", exc_info=True)
+            logger.warning("Local thumbnail could not be sent; falling back to text player.", exc_info=True)
     return await message.reply_text(
         caption,
         reply_markup=controls_keyboard(message.chat.id),
@@ -329,7 +383,7 @@ async def reply_now_playing(message, state, text=None):
 @bot_client.on_message(filters.command(["start", "help"]) & filters.group)
 async def group_help(_, message):
     text = (
-        "🎧 **NEXUS MUSIC 2.0**\n\n"
+        "🎧 **NEXUS MUSIC 2.2**\n\n"
         "👤 **Members**\n"
         "`/play <song>` · `/queue` · `/np`\n\n"
         "🛡️ **Group admins**\n"
