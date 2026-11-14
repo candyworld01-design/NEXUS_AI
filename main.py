@@ -28,10 +28,13 @@ async def start_client(client, name):
 async def main():
     health.start_health_server()
 
-    await start_client(music.bot_client, "Telegram bot")
+    # Start both Telegram sessions concurrently instead of waiting for one
+    # connection/login cycle to finish before beginning the other.
+    await asyncio.gather(
+        start_client(music.bot_client, "Telegram bot"),
+        start_client(music.assistant_client, "Assistant account"),
+    )
     health.set_component("bot_active", True)
-
-    await start_client(music.assistant_client, "Assistant account")
     health.set_component("assistant_active", True)
 
     music.initialize_runtime()
@@ -40,7 +43,7 @@ async def main():
     await music.call_py.start()
     health.set_component("pytgcalls_active", True)
 
-    logger.info("NEXUS Music 2.0 is online.")
+    logger.info("NEXUS Music 2.1 is online.")
     await asyncio.Event().wait()
 
 
