@@ -21,19 +21,23 @@ async def start_client(client, name):
             return
         except FloodWait as exc:
             delay = int(exc.value) + 5
-            logger.warning("%s FloodWait: sleeping %s seconds", name, delay)
+            logger.warning(
+                "%s FloodWait: sleeping %s seconds",
+                name,
+                delay,
+            )
             await asyncio.sleep(delay)
 
 
 async def main():
     health.start_health_server()
 
-    # Start both Telegram sessions concurrently instead of waiting for one
-    # connection/login cycle to finish before beginning the other.
+    # Start both Telegram sessions concurrently.
     await asyncio.gather(
         start_client(music.bot_client, "Telegram bot"),
         start_client(music.assistant_client, "Assistant account"),
     )
+
     health.set_component("bot_active", True)
     health.set_component("assistant_active", True)
 
@@ -41,9 +45,11 @@ async def main():
 
     logger.info("Starting PyTgCalls...")
     await music.call_py.start()
+
     health.set_component("pytgcalls_active", True)
 
-    logger.info("NEXUS Music 2.1 is online.")
+    logger.info("NEXUS Music 2.2 is online.")
+
     await asyncio.Event().wait()
 
 
