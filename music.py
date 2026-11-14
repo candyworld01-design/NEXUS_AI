@@ -83,6 +83,8 @@ def _download_sync(query):
             "title": info.get("title") or "Unknown title",
             "duration": int(info.get("duration") or 0),
             "url": info.get("webpage_url") or query,
+            "thumbnail": info.get("thumbnail"),
+            "artist": info.get("artist") or info.get("uploader") or info.get("channel") or "",
             "requester": None,
         }
 
@@ -107,15 +109,15 @@ def player_card(state, chat_title="Group"):
     duration = fmt_time(song.get("duration", 0))
     mode = state.loop_mode.upper()
     status = "⏸ PAUSED" if state.paused else "▶️ PLAYING"
+    artist = song.get("artist") or "NEXUS Music"
+    title = song.get("title") or "Unknown title"
     return (
-        "╭━━━「 **NEXUS MUSIC** 」━━━╮\n"
-        f"🎵 **{song['title']}**\n"
-        f"👤 Requested by: {song.get('requester') or 'Unknown'}\n"
-        f"⏱ Duration: `{duration}`\n"
-        f"📚 Upcoming: `{len(state.queue_preview)}` songs\n"
-        f"🔊 Volume: `{state.volume}%`  •  🔁 `{mode}`\n"
-        f"📡 Status: **{status}**\n"
-        "╰━━━━━━━━━━━━━━━━━━━━╯"
+        "🎧 **NEXUS MUSIC**  ·  **NOW PLAYING**\n\n"
+        f"🎵 **{title}**\n"
+        f"🎤 {artist}\n"
+        f"⏱ `{duration}`  ·  📚 `{len(state.queue_preview)} queued`\n"
+        f"{status}  ·  🔊 `{state.volume}%`  ·  🔁 `{mode}`\n"
+        f"🙋 {song.get('requester') or 'Member'}"
     )
 
 
@@ -305,8 +307,20 @@ async def require_admin(message):
 
 
 async def reply_now_playing(message, state, text=None):
-    await message.reply_text(
-        text or player_card(state, message.chat.title or "Group"),
+    caption = text or player_card(state, message.chat.title or "Group")
+    song = state.current or {}
+    thumbnail = song.get("thumbnail")
+    if thumbnail:
+        try:
+            return await message.reply_photo(
+                photo=thumbnail,
+                caption=caption,
+                reply_markup=controls_keyboard(message.chat.id),
+            )
+        except Exception:
+            logger.warning("Thumbnail could not be sent; falling back to text player.", exc_info=True)
+    return await message.reply_text(
+        caption,
         reply_markup=controls_keyboard(message.chat.id),
         disable_web_page_preview=True,
     )
@@ -340,11 +354,18 @@ async def play_command(_, message):
         song = await manager.download(query, message.from_user.first_name if message.from_user else "Member")
         started, response = await manager.enqueue_or_start(message.chat.id, song)
         state = await manager.get(message.chat.id)
-        await status.edit_text(
-            response,
-            reply_markup=controls_keyboard(message.chat.id) if started else None,
-            disable_web_page_preview=True,
-        )
+        if started:
+            try:
+                await status.delete()
+            except Exception:
+                pass
+            await reply_now_playing(message, state)
+        else:
+            await status.edit_text(
+                response,
+                reply_markup=None,
+                disable_web_page_preview=True,
+            )
     except Exception as exc:
         logger.exception("PLAY failed")
         if song:
@@ -561,10 +582,12 @@ async def control_callback(_, query):
             body = "\n".join(f"{i}. {x['title']}" for i, x in enumerate(items[:12], 1)) or "Queue is empty."
             return await query.answer(body[:190], show_alert=True)
         await query.answer("NEXUS control applied.")
-        await query.message.edit_text(
-            player_card(state),
-            reply_markup=controls_keyboard(chat_id) if state.current else None,
-        )
+        updated_card = player_card(state)
+        markup = controls_keyboard(chat_id) if state.current else None
+        if query.message.photo:
+            await query.message.edit_caption(caption=updated_card, reply_markup=markup)
+        else:
+            await query.message.edit_text(updated_card, reply_markup=markup)
     except Exception as exc:
         logger.exception("Callback control failed")
         await query.answer(f"Action failed: {str(exc)[:150]}", show_alert=True)
