@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import yt_dlp
 from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 
 from pytgcalls import PyTgCalls, filters as tg_filters
 from pytgcalls.types import MediaStream
@@ -149,39 +149,82 @@ def fmt_time(seconds):
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
+def _safe(value, limit=90):
+    value = str(value or "—").replace("\n", " ").strip()
+    return value[:limit] + ("…" if len(value) > limit else "")
+
+
 def player_card(state, chat_title="Group"):
     song = state.current
     if not song:
-        return "🎧 **NEXUS MUSIC**\n\nNothing is playing right now."
-    duration = fmt_time(song.get("duration", 0))
-    mode = state.loop_mode.upper()
+        return "🎧 **NEXUS MUSIC**\n\n_Idle — play a song to get started._"
+    title = _safe(song.get("title"), 100)
+    artist = _safe(song.get("artist") or "Unknown artist", 70)
     status = "⏸ PAUSED" if state.paused else "▶️ PLAYING"
-    artist = song.get("artist") or "NEXUS Music"
-    title = song.get("title") or "Unknown title"
     return (
         "🎧 **NEXUS MUSIC**  ·  **NOW PLAYING**\n\n"
-        f"🎵 **{title}**\n"
-        f"🎤 {artist}\n"
-        f"⏱ `{duration}`  ·  📚 `{len(state.queue_preview)} queued`\n"
-        f"{status}  ·  🔊 `{state.volume}%`  ·  🔁 `{mode}`\n"
-        f"🙋 {song.get('requester') or 'Member'}"
+        f"**{title}**\n"
+        f"{artist}  ·  `{fmt_time(song.get('duration', 0))}`\n\n"
+        f"{status}  ·  🙋 {_safe(song.get('requester') or 'Member', 35)}"
     )
+
+
+def details_card(state):
+    song = state.current or {}
+    if not song:
+        return "ℹ️ **TRACK DETAILS**\n\n_No track is playing._"
+    url = song.get("url") or ""
+    link = f"\n🔗 [Open source]({url})" if url.startswith(("https://", "http://")) else ""
+    return (
+        "ℹ️ **TRACK DETAILS**\n\n"
+        f"🎵 **{_safe(song.get('title'), 180)}**\n"
+        f"🎤 **Artist:** {_safe(song.get('artist') or 'Unknown', 100)}\n"
+        f"⏱ **Duration:** `{fmt_time(song.get('duration', 0))}`\n"
+        f"🙋 **Requested by:** {_safe(song.get('requester') or 'Member', 60)}"
+        f"{link}"
+    )
+
+
+def queue_card(state, items):
+    lines = ["📜 **UP NEXT**", ""]
+    if state.current:
+        lines.append(f"▶️ **Playing:** {_safe(state.current.get('title'), 100)}")
+    else:
+        lines.append("_Nothing is playing right now._")
+    lines.append("")
+    if not items:
+        lines.append("_Your queue is empty. Add a song with /play._")
+    else:
+        for i, item in enumerate(items[:12], 1):
+            lines.append(f"`{i:02}`  **{_safe(item.get('title'), 75)}**")
+            lines.append(f"      {_safe(item.get('requester') or 'Member', 35)}  ·  `{fmt_time(item.get('duration', 0))}`")
+        if len(items) > 12:
+            lines.append(f"\n…and **{len(items) - 12}** more tracks")
+    lines.append(f"\n🎶 **{len(items)}** tracks waiting")
+    return "\n".join(lines)
 
 
 def controls_keyboard(chat_id):
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("⏮ Back", callback_data=f"nx:back:{chat_id}"),
-            InlineKeyboardButton("⏸ Pause", callback_data=f"nx:pause:{chat_id}"),
-            InlineKeyboardButton("▶ Resume", callback_data=f"nx:resume:{chat_id}"),
-            InlineKeyboardButton("⏭ Skip", callback_data=f"nx:skip:{chat_id}"),
+            InlineKeyboardButton("⏮", callback_data=f"nx:back:{chat_id}"),
+            InlineKeyboardButton("⏸", callback_data=f"nx:pause:{chat_id}"),
+            InlineKeyboardButton("▶️", callback_data=f"nx:resume:{chat_id}"),
+            InlineKeyboardButton("⏭", callback_data=f"nx:skip:{chat_id}"),
         ],
         [
             InlineKeyboardButton("📜 Queue", callback_data=f"nx:queue:{chat_id}"),
+            InlineKeyboardButton("ℹ️ Details", callback_data=f"nx:details:{chat_id}"),
+        ],
+        [
             InlineKeyboardButton("🔀 Shuffle", callback_data=f"nx:shuffle:{chat_id}"),
             InlineKeyboardButton("⏹ Stop", callback_data=f"nx:stop:{chat_id}"),
         ],
     ])
+
+
+def screen_keyboard(chat_id, screen):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Player", callback_data=f"nx:player:{chat_id}")]])
 
 
 class GroupPlayer:
@@ -197,6 +240,8 @@ class GroupPlayer:
         self.queue_preview = []
         self.vote_skip = set()
         self.last_message_id = None
+        self.player_message_id = None
+        self.player_message_chat_id = None
         self.recovering = False
 
 
@@ -389,26 +434,71 @@ async def require_admin(message):
     return True
 
 
-async def reply_now_playing(message, state, text=None):
-    caption = text or player_card(state, message.chat.title or "Group")
+async def show_player(chat_id, state, target_message=None):
+    """Create one persistent player card per group, then edit it on track changes."""
+    caption = player_card(state)
     song = state.current or {}
-    thumbnail = song.get("thumbnail")
-    if thumbnail:
-        try:
-            local_thumbnail = await get_thumbnail_file(song)
-            if local_thumbnail:
-                return await message.reply_photo(
-                    photo=local_thumbnail,
-                    caption=caption,
-                    reply_markup=controls_keyboard(message.chat.id),
-                )
-        except Exception:
-            logger.warning("Local thumbnail could not be sent; falling back to text player.", exc_info=True)
-    return await message.reply_text(
-        caption,
-        reply_markup=controls_keyboard(message.chat.id),
-        disable_web_page_preview=True,
-    )
+    thumb = await get_thumbnail_file(song) if song.get("thumbnail") else None
+    markup = controls_keyboard(chat_id) if state.current else None
+    try:
+        if state.player_message_id:
+            if thumb:
+                try:
+                    media = InputMediaPhoto(thumb, caption=caption, parse_mode="markdown")
+                    await bot_client.edit_message_media(
+                        chat_id=state.player_message_chat_id or chat_id,
+                        message_id=state.player_message_id,
+                        media=media,
+                        reply_markup=markup,
+                    )
+                except Exception:
+                    try:
+                        await bot_client.edit_message_caption(
+                            chat_id=state.player_message_chat_id or chat_id,
+                            message_id=state.player_message_id,
+                            caption=caption,
+                            reply_markup=markup,
+                        )
+                    except Exception:
+                        try:
+                            await bot_client.delete_messages(state.player_message_chat_id or chat_id, state.player_message_id)
+                        except Exception:
+                            pass
+                        state.player_message_id = None
+            else:
+                # Telegram cannot convert a photo message into a text message by editing.
+                # Replace it only when a track has no thumbnail, keeping one visible card.
+                try:
+                    await bot_client.edit_message_text(
+                        chat_id=state.player_message_chat_id or chat_id,
+                        message_id=state.player_message_id,
+                        text=caption,
+                        reply_markup=markup,
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    try:
+                        await bot_client.delete_messages(state.player_message_chat_id or chat_id, state.player_message_id)
+                    except Exception:
+                        pass
+                    state.player_message_id = None
+            if state.player_message_id:
+                return
+    except Exception:
+        logger.info("Existing player card unavailable; creating a new one for %s", chat_id)
+        state.player_message_id = None
+
+    if thumb:
+        sent = await bot_client.send_photo(chat_id, thumb, caption=caption, reply_markup=markup)
+    else:
+        sent = await bot_client.send_message(chat_id, caption, reply_markup=markup, disable_web_page_preview=True)
+    state.player_message_id = sent.id
+    state.player_message_chat_id = chat_id
+
+
+async def reply_now_playing(message, state, text=None):
+    # Keep the actual player card compact and persistent. Status text, if any, is separate.
+    await show_player(message.chat.id, state)
 
 
 @bot_client.on_message(filters.command(["start", "help"]) & filters.group)
@@ -421,7 +511,7 @@ async def group_help(_, message):
         "`/skip` · `/pause` · `/resume` · `/back` · `/stop`\n"
         "`/playforce <song>` · `/shuffle` · `/loop` · `/volume 100`\n"
         "`/remove <position>` · `/clear` · `/reload` · `/refresh`\n"
-        "`/djmode on|off`\n\n"
+        "\n"
         "👑 **Group owner**\n"
         "All admin controls and group DJ configuration.\n\n"
         "NEXUS keeps each group's player and queue separate."
@@ -470,9 +560,10 @@ async def playforce_command(_, message):
     song = None
     try:
         song = await manager.download(query, message.from_user.first_name if message.from_user else "Admin")
-        text = await manager.force_play(message.chat.id, song)
+        await manager.force_play(message.chat.id, song)
         state = await manager.get(message.chat.id)
-        await status.edit_text("⚡ **FORCE PLAY**\n\n" + text, reply_markup=controls_keyboard(message.chat.id))
+        await status.edit_text("⚡ **Priority track started.**")
+        await show_player(message.chat.id, state)
     except Exception as exc:
         logger.exception("PLAYFORCE failed")
         if song:
@@ -555,6 +646,8 @@ async def stop_command(_, message):
     if not await require_admin(message):
         return
     await manager.stop(message.chat.id)
+    state = await manager.get(message.chat.id)
+    await show_player(message.chat.id, state)
     await message.reply_text("⏹️ **Playback stopped.** This group's queue was cleared.")
 
 
@@ -628,9 +721,8 @@ async def reload_command(_, message):
     status = await message.reply_text("🔄 **Reloading this group's current track...**")
     ok, detail = await manager.recover(message.chat.id, reconnect=False)
     if ok:
-        await status.edit_text("✅ **Playback reloaded.** Queue and group settings are preserved.\n\n" + detail,
-                               reply_markup=controls_keyboard(message.chat.id),
-                               disable_web_page_preview=True)
+        await status.edit_text("✅ **Playback reloaded.** Queue and group settings are preserved.")
+        await show_player(message.chat.id, await manager.get(message.chat.id))
     else:
         await status.edit_text(f"⚠️ **Reload failed:** `{detail}`")
 
@@ -642,9 +734,8 @@ async def refresh_command(_, message):
     status = await message.reply_text("♻️ **Refreshing this group's voice connection...**")
     ok, detail = await manager.recover(message.chat.id, reconnect=True)
     if ok:
-        await status.edit_text("✅ **Group connection refreshed.** Queue and group settings are preserved.\n\n" + detail,
-                               reply_markup=controls_keyboard(message.chat.id),
-                               disable_web_page_preview=True)
+        await status.edit_text("✅ **Group connection refreshed.** Queue and group settings are preserved.")
+        await show_player(message.chat.id, await manager.get(message.chat.id))
     else:
         await status.edit_text(f"⚠️ **Refresh failed:** `{detail}`")
 
@@ -655,10 +746,8 @@ async def djmode_command(_, message):
         return await message.reply_text("🔒 Only the group owner can change DJ mode.")
     if len(message.command) < 2 or message.command[1].lower() not in ("on", "off"):
         return await message.reply_text("Usage: `/djmode on` or `/djmode off`")
-    # Admin-only controls are the default policy. This switch is reserved for a later DJ allowlist.
     await message.reply_text(
-        "🎚️ DJ mode setting received. Current policy: Telegram group admins control playback; "
-        "members can request songs and view the queue."
+        "ℹ️ DJ mode is not active in this build yet. Playback remains controlled by Telegram group admins."
     )
 
 
@@ -667,15 +756,34 @@ async def control_callback(_, query):
     try:
         _, action, raw_chat = query.data.split(":", 2)
         chat_id = int(raw_chat)
-        if query.message.chat.id != chat_id:
+        if not query.message or query.message.chat.id != chat_id:
             return await query.answer("This control belongs to another group.", show_alert=True)
+
+        # Queue and Details are read-only screens available to all group members.
+        if action in ("queue", "details", "player"):
+            state = await manager.get(chat_id)
+            if action == "queue":
+                items = await queue.snapshot(chat_id)
+                body = queue_card(state, items)
+            elif action == "details":
+                body = details_card(state)
+            else:
+                body = player_card(state)
+            markup = screen_keyboard(chat_id, action) if action != "player" else controls_keyboard(chat_id)
+            if query.message.photo:
+                await query.message.edit_caption(caption=body, reply_markup=markup)
+            else:
+                await query.message.edit_text(body, reply_markup=markup, disable_web_page_preview=True)
+            return await query.answer()
+
         member = await bot_client.get_chat_member(chat_id, query.from_user.id)
         allowed = (
-            query.from_user.id == OWNER_ID
+            (OWNER_ID and query.from_user.id == OWNER_ID)
             or member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
         )
         if not allowed:
-            return await query.answer("Admin permission required.", show_alert=True)
+            return await query.answer("Playback controls are for group admins.", show_alert=True)
+
         state = await manager.get(chat_id)
         if action == "pause":
             await call_py.pause(chat_id); state.paused = True
@@ -691,20 +799,17 @@ async def control_callback(_, query):
         elif action == "shuffle":
             await queue.shuffle(chat_id)
             state.queue_preview = await queue.snapshot(chat_id)
-        elif action == "queue":
-            items = await queue.snapshot(chat_id)
-            body = "\n".join(f"{i}. {x['title']}" for i, x in enumerate(items[:12], 1)) or "Queue is empty."
-            return await query.answer(body[:190], show_alert=True)
-        await query.answer("NEXUS control applied.")
-        updated_card = player_card(state)
-        markup = controls_keyboard(chat_id) if state.current else None
-        if query.message.photo:
-            await query.message.edit_caption(caption=updated_card, reply_markup=markup)
         else:
-            await query.message.edit_text(updated_card, reply_markup=markup)
+            return await query.answer("Unknown control.", show_alert=True)
+
+        await query.answer("NEXUS updated.")
+        await show_player(chat_id, state)
     except Exception as exc:
         logger.exception("Callback control failed")
-        await query.answer(f"Action failed: {str(exc)[:150]}", show_alert=True)
+        try:
+            await query.answer(f"Action failed: {str(exc)[:120]}", show_alert=True)
+        except Exception:
+            pass
 
 
 def register_stream_handler():
@@ -715,6 +820,7 @@ def register_stream_handler():
             return
         generation = state.generation
         await manager.next_song(update.chat_id, expected_generation=generation)
+        await show_player(update.chat_id, state)
 
 
 def initialize_runtime():
