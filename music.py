@@ -1,23 +1,34 @@
 import asyncio
 import logging
 import os
-import random
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 import yt_dlp
+
 from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    InputMediaPhoto,
+)
 
 from pytgcalls import PyTgCalls, filters as tg_filters
 from pytgcalls.types import MediaStream
 
 from config import (
-    API_ID, API_HASH, BOT_TOKEN, STRING_SESSION, OWNER_ID,
-    MAX_QUEUE_SIZE, MAX_VOLUME, DEFAULT_VOLUME,
+    API_ID,
+    API_HASH,
+    BOT_TOKEN,
+    STRING_SESSION,
+    OWNER_ID,
+    MAX_QUEUE_SIZE,
+    MAX_VOLUME,
+    DEFAULT_VOLUME,
 )
+
 from music_queue import queue
 
 
@@ -61,7 +72,7 @@ def ydl_options():
         "retries": 2,
         "fragment_retries": 2,
         "extractor_retries": 2,
-        "socket_timeout": 15,
+        "socket_timeout": 12,
         "skip_download": True,
     }
 
@@ -89,7 +100,7 @@ def _first_entry(info):
         ]
 
         if not entries:
-            raise RuntimeError("No song found for that search.")
+            raise RuntimeError("No song found.")
 
         return entries[0]
 
@@ -104,16 +115,19 @@ def _get_audio_url(info):
 
     formats = [
         item for item in (info.get("formats") or [])
-        if item.get("url") and item.get("acodec") != "none"
+        if item.get("url")
+        and item.get("acodec") != "none"
     ]
 
     if not formats:
-        raise RuntimeError("No playable audio stream was found.")
+        raise RuntimeError("No playable audio stream found.")
 
     return formats[-1]["url"]
 
 
 def _extract_info_sync(query):
+    started = time.monotonic()
+
     with yt_dlp.YoutubeDL(ydl_options()) as ydl:
 
         target = (
@@ -128,7 +142,7 @@ def _extract_info_sync(query):
 
         stream_url = _get_audio_url(info)
 
-        return {
+        song = {
             "file": None,
             "stream_url": stream_url,
             "stream_fetched_at": time.time(),
@@ -147,6 +161,16 @@ def _extract_info_sync(query):
             "added_at": time.time(),
         }
 
+    elapsed = time.monotonic() - started
+
+    logger.info(
+        "SEARCH completed in %.2fs | %s",
+        elapsed,
+        song["title"],
+    )
+
+    return song
+
 
 def _refresh_stream_sync(webpage_url):
     with yt_dlp.YoutubeDL(ydl_options()) as ydl:
@@ -159,6 +183,7 @@ def _refresh_stream_sync(webpage_url):
 
 
 async def search_and_download(query, requester):
+    started = time.monotonic()
     loop = asyncio.get_running_loop()
 
     song = await loop.run_in_executor(
@@ -170,11 +195,17 @@ async def search_and_download(query, requester):
     song["requester"] = requester
     song["added_at"] = time.time()
 
+    logger.info(
+        "SEARCH TOTAL %.2fs | %s",
+        time.monotonic() - started,
+        song["title"],
+    )
+
     return song
 
 
 # =========================================================
-# THUMBNAIL
+# THUMBNAILS
 # =========================================================
 
 def _download_thumbnail_sync(url, video_id):
@@ -195,7 +226,7 @@ def _download_thumbnail_sync(url, video_id):
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=8) as response:
+        with urllib.request.urlopen(request, timeout=6) as response:
             data = response.read(5 * 1024 * 1024)
 
         if len(data) < 1000:
@@ -207,7 +238,10 @@ def _download_thumbnail_sync(url, video_id):
         return path
 
     except Exception:
-        logger.warning("Thumbnail download failed", exc_info=True)
+        logger.warning(
+            "Thumbnail download failed.",
+            exc_info=True,
+        )
         return None
 
 
@@ -222,6 +256,8 @@ async def get_thumbnail_file(song):
     video_url = song.get("url", "")
     video_id = video_url.rstrip("/").split("=")[-1][:80]
 
+    started = time.monotonic()
+
     path = await loop.run_in_executor(
         executor,
         _download_thumbnail_sync,
@@ -230,6 +266,11 @@ async def get_thumbnail_file(song):
     )
 
     song["thumbnail_file"] = path
+
+    logger.info(
+        "THUMBNAIL completed in %.2fs",
+        time.monotonic() - started,
+    )
 
     return path
 
@@ -255,41 +296,53 @@ def delete_song_file(song):
     if not song:
         return
 
-    for key in ("file", "thumbnail_file"):
-        path = song.get(key)
+    path = song.get("file")
 
-        if path and os.path.isfile(path):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def safe_text(value, limit=80):
+    value = str(value or "Unknown")
+    value = value.replace("<", "").replace(">", "")
+
+    if len(value) > limit:
+        return value[:limit - 3] + "..."
+
+    return value
 
 
 # =========================================================
 # PLAYER UI
 # =========================================================
 
-def player_card(state, chat_title="Group"):
+def player_card(state):
     song = state.current
 
     if not song:
         return (
-            "🎵 **NEXUS MUSIC**\n\n"
-            "📭 Nothing is playing right now."
+            "🎧 **NEXUS MUSIC**\n\n"
+            "📭 Nothing is playing right now.\n"
+            "Use `/play` to start music."
         )
 
-    title = song.get("title") or "Unknown title"
-    artist = song.get("artist") or "Unknown artist"
-    duration = fmt_time(song.get("duration", 0))
-    requester = song.get("requester") or "Member"
+    title = safe_text(song.get("title"), 120)
+    artist = safe_text(song.get("artist"), 70)
+    requester = safe_text(song.get("requester"), 40)
 
-    status = "⏸ Paused" if state.paused else "▶️ Playing"
+    duration = fmt_time(song.get("duration", 0))
+
+    status = "⏸ PAUSED" if state.paused else "▶️ NOW PLAYING"
 
     return (
         f"🎵 **{title}**\n"
         f"🎤 {artist}\n"
         f"⏱ `{duration}`\n\n"
-        f"{status} · Requested by **{requester}**"
+        f"{status}\n"
+        f"👤 Requested by **{requester}**"
     )
 
 
@@ -322,6 +375,8 @@ def controls_keyboard(chat_id):
                 "ℹ️ Details",
                 callback_data=f"nx:details:{chat_id}",
             ),
+        ],
+        [
             InlineKeyboardButton(
                 "🔀 Shuffle",
                 callback_data=f"nx:shuffle:{chat_id}",
@@ -355,10 +410,10 @@ def details_card(state):
 
     text = (
         "ℹ️ **SONG DETAILS**\n\n"
-        f"🎵 **Title:** {song.get('title', 'Unknown')}\n"
-        f"🎤 **Artist:** {song.get('artist') or 'Unknown artist'}\n"
+        f"🎵 **Title:** {safe_text(song.get('title'), 150)}\n"
+        f"🎤 **Artist:** {safe_text(song.get('artist'), 100)}\n"
         f"⏱ **Duration:** `{fmt_time(song.get('duration', 0))}`\n"
-        f"🙋 **Requested by:** {song.get('requester') or 'Member'}\n"
+        f"🙋 **Requested by:** {safe_text(song.get('requester'), 50)}\n"
         f"📡 **Status:** {'Paused' if state.paused else 'Playing'}"
     )
 
@@ -374,7 +429,7 @@ def queue_card(state, items):
     if state.current:
         lines.append(
             f"\n▶️ **Now Playing:** "
-            f"{state.current.get('title', 'Unknown')}"
+            f"{safe_text(state.current.get('title'), 100)}"
         )
 
     if not items:
@@ -382,8 +437,8 @@ def queue_card(state, items):
 
     for index, item in enumerate(items[:12], 1):
         lines.append(
-            f"\n`{index}.` {item.get('title', 'Unknown')}"
-            f"\n   👤 {item.get('requester', 'Member')}"
+            f"\n`{index}.` {safe_text(item.get('title'), 90)}"
+            f"\n   👤 {safe_text(item.get('requester'), 40)}"
         )
 
     if len(items) > 12:
@@ -399,6 +454,7 @@ def queue_card(state, items):
 # =========================================================
 
 class GroupPlayer:
+
     def __init__(self, chat_id):
         self.chat_id = chat_id
         self.lock = asyncio.Lock()
@@ -424,6 +480,7 @@ class GroupPlayer:
 # =========================================================
 
 class PlayerManager:
+
     def __init__(self):
         self.groups = {}
         self._groups_lock = asyncio.Lock()
@@ -444,12 +501,16 @@ class PlayerManager:
         stream_url = song.get("stream_url")
         fetched_at = song.get("stream_fetched_at", 0)
 
-        # Reuse the URL obtained during search.
-        # Refresh it only if missing or older than 3 minutes.
+        # Reuse fresh URL obtained during search.
         if (
             not stream_url
             or time.time() - fetched_at > 180
         ):
+            logger.info(
+                "Refreshing expired stream URL: %s",
+                song.get("title"),
+            )
+
             stream_url = await loop.run_in_executor(
                 executor,
                 _refresh_stream_sync,
@@ -458,6 +519,8 @@ class PlayerManager:
 
             song["stream_url"] = stream_url
             song["stream_fetched_at"] = time.time()
+
+        started = time.monotonic()
 
         await call_py.play(
             state.chat_id,
@@ -472,10 +535,18 @@ class PlayerManager:
         state.vote_skip.clear()
         state.generation += 1
 
+        logger.info(
+            "PLAYBACK STARTED in %.2fs | %s | %s",
+            time.monotonic() - started,
+            state.chat_id,
+            song.get("title"),
+        )
+
     async def enqueue_or_start(self, chat_id, song):
         state = await self.get(chat_id)
 
         async with state.lock:
+
             if state.current:
                 position = await queue.add(
                     chat_id,
@@ -489,7 +560,7 @@ class PlayerManager:
                     False,
                     f"➕ **Added to queue**\n"
                     f"Position: `{position}`\n"
-                    f"🎵 {song['title']}",
+                    f"🎵 {safe_text(song['title'], 100)}",
                 )
 
             await self.play_song(state, song)
@@ -502,6 +573,7 @@ class PlayerManager:
         state = await self.get(chat_id)
 
         async with state.lock:
+
             old = state.current
 
             if old:
@@ -520,6 +592,7 @@ class PlayerManager:
         state = await self.get(chat_id)
 
         async with state.lock:
+
             if (
                 expected_generation is not None
                 and expected_generation != state.generation
@@ -548,6 +621,7 @@ class PlayerManager:
                     state.previous.pop(0)
 
             while next_item:
+
                 try:
                     await self.play_song(state, next_item)
 
@@ -560,8 +634,6 @@ class PlayerManager:
                         "Could not play queued song in %s",
                         chat_id,
                     )
-
-                    delete_song_file(next_item)
 
                     next_item = await queue.get_next(chat_id)
 
@@ -589,9 +661,9 @@ class PlayerManager:
         state = await self.get(chat_id)
 
         async with state.lock:
+
             state.generation += 1
 
-            old = state.current
             queued = await queue.clear(chat_id)
 
             state.current = None
@@ -612,8 +684,6 @@ class PlayerManager:
                     chat_id,
                 )
 
-            delete_song_file(old)
-
             for item in queued:
                 delete_song_file(item)
 
@@ -621,6 +691,7 @@ class PlayerManager:
         state = await self.get(chat_id)
 
         async with state.lock:
+
             if not state.previous:
                 return False
 
@@ -661,18 +732,71 @@ async def update_player_message(
         else None
     )
 
-    # Edit existing player message.
-    if state.last_message_id:
+    # No song: update existing player card.
+    if not state.current:
+
+        if state.last_message_id:
+            try:
+                if state.last_message_is_photo:
+                    await bot_client.edit_message_caption(
+                        chat_id,
+                        state.last_message_id,
+                        caption=text,
+                        reply_markup=None,
+                    )
+
+                else:
+                    await bot_client.edit_message_text(
+                        chat_id,
+                        state.last_message_id,
+                        text,
+                        reply_markup=None,
+                        disable_web_page_preview=True,
+                    )
+
+            except Exception:
+                logger.warning(
+                    "Could not update stopped player.",
+                    exc_info=True,
+                )
+
+        return
+
+    # Prepare thumbnail.
+    thumbnail = None
+
+    if state.current.get("thumbnail"):
         try:
-            if state.last_message_is_photo:
-                await bot_client.edit_message_caption(
+            thumbnail = await get_thumbnail_file(state.current)
+
+        except Exception:
+            logger.exception("Thumbnail retrieval failed.")
+
+    new_is_photo = bool(thumbnail)
+
+    # Existing player message.
+    if state.last_message_id:
+
+        try:
+
+            # Photo -> Photo: replace actual thumbnail.
+            if state.last_message_is_photo and new_is_photo:
+
+                await bot_client.edit_message_media(
                     chat_id,
                     state.last_message_id,
-                    caption=text,
+                    media=InputMediaPhoto(
+                        media=thumbnail,
+                        caption=text,
+                    ),
                     reply_markup=markup,
                 )
 
-            else:
+                return
+
+            # Text -> Text.
+            if not state.last_message_is_photo and not new_is_photo:
+
                 await bot_client.edit_message_text(
                     chat_id,
                     state.last_message_id,
@@ -681,52 +805,32 @@ async def update_player_message(
                     disable_web_page_preview=True,
                 )
 
-            return
+                return
 
         except Exception:
             logger.warning(
-                "Existing player message could not be edited.",
+                "Player message edit failed.",
                 exc_info=True,
             )
 
-            try:
-                await bot_client.delete_messages(
-                    chat_id,
-                    state.last_message_id,
-                )
-
-            except Exception:
-                pass
-
-            state.last_message_id = None
-            state.last_message_is_photo = False
-
-    # Do not create an empty player card without a current song.
-    if not state.current:
-        return
-
-    song = state.current
-    thumbnail = None
-
-    if song.get("thumbnail"):
+        # Photo/text type changed or edit failed.
         try:
-            thumbnail = await get_thumbnail_file(song)
+            await bot_client.delete_messages(
+                chat_id,
+                state.last_message_id,
+            )
 
         except Exception:
-            logger.warning(
-                "Thumbnail retrieval failed.",
-                exc_info=True,
-            )
+            pass
 
-    if thumbnail:
-        if fallback_message:
-            sent = await fallback_message.reply_photo(
-                photo=thumbnail,
-                caption=text,
-                reply_markup=markup,
-            )
+        state.last_message_id = None
+        state.last_message_is_photo = False
 
-        else:
+    # Send new player message.
+    try:
+
+        if new_is_photo:
+
             sent = await bot_client.send_photo(
                 chat_id,
                 photo=thumbnail,
@@ -734,17 +838,10 @@ async def update_player_message(
                 reply_markup=markup,
             )
 
-        state.last_message_is_photo = True
-
-    else:
-        if fallback_message:
-            sent = await fallback_message.reply_text(
-                text,
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
+            state.last_message_is_photo = True
 
         else:
+
             sent = await bot_client.send_message(
                 chat_id,
                 text,
@@ -752,13 +849,15 @@ async def update_player_message(
                 disable_web_page_preview=True,
             )
 
-        state.last_message_is_photo = False
+            state.last_message_is_photo = False
 
-    state.last_message_id = sent.id
+        state.last_message_id = sent.id
+
+    except Exception:
+        logger.exception("Could not send player message.")
 
 
 async def reply_now_playing(message, state, text=None):
-    # Update the existing player instead of sending duplicate cards.
     await update_player_message(
         state,
         message.chat.id,
@@ -771,6 +870,7 @@ async def reply_now_playing(message, state, text=None):
 # =========================================================
 
 async def is_admin(message):
+
     if (
         message.from_user
         and OWNER_ID
@@ -782,6 +882,7 @@ async def is_admin(message):
         return False
 
     try:
+
         member = await bot_client.get_chat_member(
             message.chat.id,
             message.from_user.id,
@@ -797,6 +898,7 @@ async def is_admin(message):
 
 
 async def is_group_owner(message):
+
     if (
         message.from_user
         and OWNER_ID
@@ -808,6 +910,7 @@ async def is_group_owner(message):
         return False
 
     try:
+
         member = await bot_client.get_chat_member(
             message.chat.id,
             message.from_user.id,
@@ -820,7 +923,9 @@ async def is_group_owner(message):
 
 
 async def require_admin(message):
+
     if not await is_admin(message):
+
         await message.reply_text(
             "🔒 **Admin only**\n"
             "This control is reserved for group admins."
@@ -839,17 +944,22 @@ async def require_admin(message):
     filters.command(["start", "help"]) & filters.group
 )
 async def group_help(_, message):
+
     text = (
         "🎧 **NEXUS MUSIC**\n\n"
+
         "👤 **Members**\n"
         "`/play <song>` · `/queue` · `/np`\n\n"
+
         "🛡️ **Group admins**\n"
         "`/skip` · `/pause` · `/resume` · `/back` · `/stop`\n"
         "`/playforce <song>` · `/shuffle` · `/loop`\n"
         "`/volume 100` · `/remove <position>` · `/clear`\n\n"
+
         "👑 **Group owner**\n"
-        "All admin controls and group DJ configuration.\n\n"
-        "NEXUS keeps each group's player and queue separate."
+        "All admin controls and DJ configuration.\n\n"
+
+        "NEXUS keeps every group's player and queue separate."
     )
 
     await message.reply_text(
@@ -866,7 +976,9 @@ async def group_help(_, message):
     filters.command("play") & filters.group
 )
 async def play_command(_, message):
+
     if len(message.command) < 2:
+
         return await message.reply_text(
             "🎵 Usage: `/play song name`"
         )
@@ -874,19 +986,23 @@ async def play_command(_, message):
     query = " ".join(message.command[1:])
 
     status = await message.reply_text(
-        "🔎 **Searching NEXUS library...**"
+        "🔎 **Searching...**"
     )
 
     song = None
 
     try:
+
         requester = (
             message.from_user.first_name
             if message.from_user
             else "Member"
         )
 
-        song = await manager.download(query, requester)
+        song = await manager.download(
+            query,
+            requester,
+        )
 
         started, response = await manager.enqueue_or_start(
             message.chat.id,
@@ -894,6 +1010,7 @@ async def play_command(_, message):
         )
 
         if started:
+
             try:
                 await status.delete()
             except Exception:
@@ -904,6 +1021,7 @@ async def play_command(_, message):
             await reply_now_playing(message, state)
 
         else:
+
             await status.edit_text(
                 response,
                 reply_markup=None,
@@ -911,14 +1029,12 @@ async def play_command(_, message):
             )
 
     except Exception as exc:
-        logger.exception("PLAY failed")
 
-        if song:
-            delete_song_file(song)
+        logger.exception("PLAY failed")
 
         await status.edit_text(
             f"⚠️ **Couldn't play this request.**\n"
-            f"`{str(exc)[:350]}`"
+            f"`{str(exc)[:300]}`"
         )
 
 
@@ -930,10 +1046,12 @@ async def play_command(_, message):
     filters.command("playforce") & filters.group
 )
 async def playforce_command(_, message):
+
     if not await require_admin(message):
         return
 
     if len(message.command) < 2:
+
         return await message.reply_text(
             "⚡ Usage: `/playforce song name`"
         )
@@ -944,16 +1062,18 @@ async def playforce_command(_, message):
         "⚡ **Preparing priority request...**"
     )
 
-    song = None
-
     try:
+
         requester = (
             message.from_user.first_name
             if message.from_user
             else "Admin"
         )
 
-        song = await manager.download(query, requester)
+        song = await manager.download(
+            query,
+            requester,
+        )
 
         await manager.force_play(
             message.chat.id,
@@ -970,29 +1090,29 @@ async def playforce_command(_, message):
         await reply_now_playing(message, state)
 
     except Exception as exc:
+
         logger.exception("PLAYFORCE failed")
 
-        if song:
-            delete_song_file(song)
-
         await status.edit_text(
-            f"⚠️ **Force play failed:** `{str(exc)[:300]}`"
+            f"⚠️ **Force play failed:** `{str(exc)[:250]}`"
         )
 
 
 # =========================================================
-# QUEUE COMMAND
+# QUEUE
 # =========================================================
 
 @bot_client.on_message(
     filters.command("queue") & filters.group
 )
 async def queue_command(_, message):
+
     state = await manager.get(message.chat.id)
 
     items = await queue.snapshot(message.chat.id)
 
     if not state.current and not items:
+
         return await message.reply_text(
             "📭 **Queue is empty.** Use `/play song name`."
         )
@@ -1010,9 +1130,11 @@ async def queue_command(_, message):
     filters.command(["np", "nowplaying"]) & filters.group
 )
 async def np_command(_, message):
+
     state = await manager.get(message.chat.id)
 
     if not state.current:
+
         return await message.reply_text(
             "📭 Nothing is playing right now."
         )
@@ -1028,6 +1150,7 @@ async def np_command(_, message):
     filters.command("skip") & filters.group
 )
 async def skip_command(_, message):
+
     if not await require_admin(message):
         return
 
@@ -1035,7 +1158,10 @@ async def skip_command(_, message):
 
     state = await manager.get(message.chat.id)
 
-    await reply_now_playing(message, state)
+    await update_player_message(
+        state,
+        message.chat.id,
+    )
 
 
 # =========================================================
@@ -1046,17 +1172,20 @@ async def skip_command(_, message):
     filters.command("pause") & filters.group
 )
 async def pause_command(_, message):
+
     if not await require_admin(message):
         return
 
     state = await manager.get(message.chat.id)
 
     if not state.current:
+
         return await message.reply_text(
             "Nothing is playing."
         )
 
     try:
+
         await call_py.pause(message.chat.id)
 
         state.paused = True
@@ -1064,12 +1193,12 @@ async def pause_command(_, message):
         await update_player_message(
             state,
             message.chat.id,
-            fallback_message=message,
         )
 
     except Exception as exc:
+
         await message.reply_text(
-            f"Pause failed: `{str(exc)[:250]}`"
+            f"Pause failed: `{str(exc)[:200]}`"
         )
 
 
@@ -1081,17 +1210,20 @@ async def pause_command(_, message):
     filters.command("resume") & filters.group
 )
 async def resume_command(_, message):
+
     if not await require_admin(message):
         return
 
     state = await manager.get(message.chat.id)
 
     if not state.current:
+
         return await message.reply_text(
             "Nothing is playing."
         )
 
     try:
+
         await call_py.resume(message.chat.id)
 
         state.paused = False
@@ -1099,12 +1231,12 @@ async def resume_command(_, message):
         await update_player_message(
             state,
             message.chat.id,
-            fallback_message=message,
         )
 
     except Exception as exc:
+
         await message.reply_text(
-            f"Resume failed: `{str(exc)[:250]}`"
+            f"Resume failed: `{str(exc)[:200]}`"
         )
 
 
@@ -1116,19 +1248,24 @@ async def resume_command(_, message):
     filters.command("back") & filters.group
 )
 async def back_command(_, message):
+
     if not await require_admin(message):
         return
 
     ok = await manager.back(message.chat.id)
 
-    state = await manager.get(message.chat.id)
-
     if not ok:
+
         return await message.reply_text(
             "No previous track is available."
         )
 
-    await reply_now_playing(message, state)
+    state = await manager.get(message.chat.id)
+
+    await update_player_message(
+        state,
+        message.chat.id,
+    )
 
 
 # =========================================================
@@ -1139,6 +1276,7 @@ async def back_command(_, message):
     filters.command("stop") & filters.group
 )
 async def stop_command(_, message):
+
     if not await require_admin(message):
         return
 
@@ -1152,7 +1290,7 @@ async def stop_command(_, message):
     )
 
     await message.reply_text(
-        "⏹️ **Playback stopped.** This group's queue was cleared."
+        "⏹️ **Playback stopped.** Queue cleared."
     )
 
 
@@ -1164,6 +1302,7 @@ async def stop_command(_, message):
     filters.command("shuffle") & filters.group
 )
 async def shuffle_command(_, message):
+
     if not await require_admin(message):
         return
 
@@ -1186,6 +1325,7 @@ async def shuffle_command(_, message):
     filters.command("loop") & filters.group
 )
 async def loop_command(_, message):
+
     if not await require_admin(message):
         return
 
@@ -1210,15 +1350,18 @@ async def loop_command(_, message):
     filters.command("volume") & filters.group
 )
 async def volume_command(_, message):
+
     if not await require_admin(message):
         return
 
     if len(message.command) < 2:
+
         return await message.reply_text(
-            "Usage: `/volume 100` (1–200)"
+            "Usage: `/volume 100`"
         )
 
     try:
+
         value = max(
             1,
             min(int(message.command[1]), MAX_VOLUME),
@@ -1238,8 +1381,9 @@ async def volume_command(_, message):
         )
 
     except Exception as exc:
+
         await message.reply_text(
-            f"Volume change failed: `{str(exc)[:250]}`"
+            f"Volume change failed: `{str(exc)[:200]}`"
         )
 
 
@@ -1251,6 +1395,7 @@ async def volume_command(_, message):
     filters.command("remove") & filters.group
 )
 async def remove_command(_, message):
+
     if not await require_admin(message):
         return
 
@@ -1258,6 +1403,7 @@ async def remove_command(_, message):
         len(message.command) < 2
         or not message.command[1].isdigit()
     ):
+
         return await message.reply_text(
             "Usage: `/remove 2`"
         )
@@ -1268,18 +1414,17 @@ async def remove_command(_, message):
     )
 
     if not item:
+
         return await message.reply_text(
             "That queue position does not exist."
         )
-
-    delete_song_file(item)
 
     state = await manager.get(message.chat.id)
 
     state.queue_preview = await queue.snapshot(message.chat.id)
 
     await message.reply_text(
-        f"🗑 Removed: **{item['title']}**"
+        f"🗑 Removed: **{safe_text(item['title'], 100)}**"
     )
 
 
@@ -1291,13 +1436,11 @@ async def remove_command(_, message):
     filters.command("clear") & filters.group
 )
 async def clear_command(_, message):
+
     if not await require_admin(message):
         return
 
     items = await queue.clear(message.chat.id)
-
-    for item in items:
-        delete_song_file(item)
 
     state = await manager.get(message.chat.id)
 
@@ -1317,7 +1460,9 @@ async def clear_command(_, message):
     filters.command("djmode") & filters.group
 )
 async def djmode_command(_, message):
+
     if not await is_group_owner(message):
+
         return await message.reply_text(
             "🔒 Only the group owner can change DJ mode."
         )
@@ -1326,14 +1471,14 @@ async def djmode_command(_, message):
         len(message.command) < 2
         or message.command[1].lower() not in ("on", "off")
     ):
+
         return await message.reply_text(
             "Usage: `/djmode on` or `/djmode off`"
         )
 
     await message.reply_text(
-        "🎚️ DJ mode setting received. "
-        "Current policy: Telegram group admins control playback; "
-        "members can request songs and view the queue."
+        "🎚️ DJ mode configuration is not persisted yet. "
+        "Playback controls currently remain admin-only."
     )
 
 
@@ -1345,12 +1490,15 @@ async def djmode_command(_, message):
     filters.regex(r"^nx:")
 )
 async def control_callback(_, query):
+
     try:
+
         _, action, raw_chat = query.data.split(":", 2)
 
         chat_id = int(raw_chat)
 
         if query.message.chat.id != chat_id:
+
             return await query.answer(
                 "This control belongs to another group.",
                 show_alert=True,
@@ -1358,11 +1506,9 @@ async def control_callback(_, query):
 
         state = await manager.get(chat_id)
 
-        # -------------------------------------------------
-        # READ-ONLY: QUEUE
-        # -------------------------------------------------
-
+        # Queue screen.
         if action == "queue":
+
             items = await queue.snapshot(chat_id)
 
             text = queue_card(state, items)
@@ -1370,11 +1516,14 @@ async def control_callback(_, query):
             await query.answer()
 
             if query.message.photo:
+
                 await query.message.edit_caption(
                     caption=text,
                     reply_markup=screen_keyboard(chat_id),
                 )
+
             else:
+
                 await query.message.edit_text(
                     text,
                     reply_markup=screen_keyboard(chat_id),
@@ -1383,21 +1532,22 @@ async def control_callback(_, query):
 
             return
 
-        # -------------------------------------------------
-        # READ-ONLY: DETAILS
-        # -------------------------------------------------
-
+        # Details screen.
         if action == "details":
+
             text = details_card(state)
 
             await query.answer()
 
             if query.message.photo:
+
                 await query.message.edit_caption(
                     caption=text,
                     reply_markup=screen_keyboard(chat_id),
                 )
+
             else:
+
                 await query.message.edit_text(
                     text,
                     reply_markup=screen_keyboard(chat_id),
@@ -1406,40 +1556,24 @@ async def control_callback(_, query):
 
             return
 
-        # -------------------------------------------------
-        # BACK TO PLAYER
-        # -------------------------------------------------
-
+        # Back to player.
         if action == "player":
-            text = player_card(state)
 
-            markup = (
-                controls_keyboard(chat_id)
-                if state.current
-                else None
-            )
+            state.last_message_id = query.message.id
+            state.last_message_is_photo = bool(query.message.photo)
 
             await query.answer()
 
-            if query.message.photo:
-                await query.message.edit_caption(
-                    caption=text,
-                    reply_markup=markup,
-                )
-            else:
-                await query.message.edit_text(
-                    text,
-                    reply_markup=markup,
-                    disable_web_page_preview=True,
-                )
+            await update_player_message(
+                state,
+                chat_id,
+            )
 
             return
 
-        # -------------------------------------------------
-        # ADMIN PERMISSION
-        # -------------------------------------------------
-
+        # Admin permission.
         try:
+
             member = await bot_client.get_chat_member(
                 chat_id,
                 query.from_user.id,
@@ -1457,24 +1591,24 @@ async def control_callback(_, query):
             )
 
         except Exception:
+
             allowed = bool(
                 OWNER_ID
                 and query.from_user.id == OWNER_ID
             )
 
         if not allowed:
+
             return await query.answer(
                 "Admin permission required.",
                 show_alert=True,
             )
 
-        # -------------------------------------------------
-        # PLAYBACK ACTIONS
-        # -------------------------------------------------
-
+        # Playback controls.
         if action == "pause":
 
             if not state.current:
+
                 return await query.answer(
                     "Nothing is playing.",
                     show_alert=True,
@@ -1487,6 +1621,7 @@ async def control_callback(_, query):
         elif action == "resume":
 
             if not state.current:
+
                 return await query.answer(
                     "Nothing is playing.",
                     show_alert=True,
@@ -1503,6 +1638,7 @@ async def control_callback(_, query):
         elif action == "back":
 
             if not await manager.back(chat_id):
+
                 return await query.answer(
                     "No previous track.",
                     show_alert=True,
@@ -1519,16 +1655,18 @@ async def control_callback(_, query):
             state.queue_preview = await queue.snapshot(chat_id)
 
         else:
+
             return await query.answer(
                 "Unknown control.",
                 show_alert=True,
             )
 
-        # Remember the message used by the player.
         state.last_message_id = query.message.id
         state.last_message_is_photo = bool(query.message.photo)
 
-        await query.answer("NEXUS control applied.")
+        await query.answer(
+            "NEXUS control applied."
+        )
 
         await update_player_message(
             state,
@@ -1536,11 +1674,13 @@ async def control_callback(_, query):
         )
 
     except Exception as exc:
+
         logger.exception("Callback control failed")
 
         try:
+
             await query.answer(
-                f"Action failed: {str(exc)[:150]}",
+                f"Action failed: {str(exc)[:120]}",
                 show_alert=True,
             )
 
@@ -1585,4 +1725,4 @@ def initialize_runtime():
 
     logger.info(
         "NEXUS Music runtime initialized."
-    )
+        )
