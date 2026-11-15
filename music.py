@@ -89,6 +89,7 @@ def _extract_info_sync(query):
             "thumbnail": info.get("thumbnail"),
             "artist": info.get("artist") or info.get("uploader") or info.get("channel") or "",
             "requester": None,
+            "extracted_at": time.time(),
         }
 
 
@@ -243,6 +244,7 @@ class GroupPlayer:
         self.player_message_id = None
         self.player_message_chat_id = None
         self.recovering = False
+        self.last_transition_at = 0.0
 
 
 class PlayerManager:
@@ -260,9 +262,18 @@ class PlayerManager:
         return await search_and_download(query, requester)
 
     async def play_song(self, state, song):
-        loop = asyncio.get_running_loop()
-        stream_url = await loop.run_in_executor(executor, _refresh_stream_sync, song["url"])
-        song["stream_url"] = stream_url
+        # Search already resolves a playable media URL. Reuse it for fast startup;
+        # only resolve again when a queued URL is missing or has likely expired.
+        stream_url = song.get("stream_url")
+        extracted_at = float(song.get("extracted_at") or 0)
+        if not stream_url or time.time() - extracted_at > 12 * 60:
+            loop = asyncio.get_running_loop()
+            stream_url = await loop.run_in_executor(
+                executor, _refresh_stream_sync, song["url"]
+            )
+            song["stream_url"] = stream_url
+            song["extracted_at"] = time.time()
+
         await call_py.play(
             state.chat_id,
             MediaStream(stream_url, video_flags=MediaStream.Flags.IGNORE),
@@ -271,6 +282,7 @@ class PlayerManager:
         state.paused = False
         state.vote_skip.clear()
         state.generation += 1
+        state.last_transition_at = time.monotonic()
 
     async def enqueue_or_start(self, chat_id, song):
         state = await self.get(chat_id)
@@ -302,6 +314,7 @@ class PlayerManager:
             song = state.current
             state.recovering = True
             state.generation += 1  # invalidate any previously scheduled end event
+            state.last_transition_at = time.monotonic()
             try:
                 if reconnect:
                     try:
@@ -320,43 +333,72 @@ class PlayerManager:
             finally:
                 state.recovering = False
 
+    async def _advance_locked(self, state, expected_generation=None, force_skip=False):
+        """Advance one group's queue. Caller must hold state.lock."""
+        if expected_generation is not None and expected_generation != state.generation:
+            return False
+        old = state.current
+        if not old:
+            return False
+
+        # A manual skip always moves forward, even when loop= song.
+        if not force_skip and state.loop_mode == "song":
+            next_item = old
+        else:
+            # Loop-queue keeps cycling the old track to the end, even on manual skip.
+            if old and state.loop_mode == "queue":
+                await queue.add(state.chat_id, old, MAX_QUEUE_SIZE + 1)
+            next_item = await queue.get_next(state.chat_id)
+
+        if old and old is not next_item:
+            state.previous.append(old)
+            if len(state.previous) > 10:
+                state.previous.pop(0)
+
+        while next_item:
+            try:
+                await self.play_song(state, next_item)
+                state.queue_preview = await queue.snapshot(state.chat_id)
+                return True
+            except Exception:
+                logger.exception("Could not play queued song in %s", state.chat_id)
+                delete_song_file(next_item)
+                next_item = await queue.get_next(state.chat_id)
+
+        state.current = None
+        state.paused = False
+        state.queue_preview = []
+        state.generation += 1
+        state.last_transition_at = time.monotonic()
+        try:
+            await call_py.leave_call(state.chat_id)
+        except Exception:
+            logger.info("No active call to leave for %s", state.chat_id)
+        return True
+
     async def next_song(self, chat_id, expected_generation=None):
         state = await self.get(chat_id)
         async with state.lock:
-            if expected_generation is not None and expected_generation != state.generation:
-                return
-            old = state.current
-            if old and state.loop_mode == "song":
-                next_item = old
-            else:
-                if old and state.loop_mode == "queue":
-                    await queue.add(chat_id, old, MAX_QUEUE_SIZE + 1)
-                next_item = await queue.get_next(chat_id)
-            if old and old is not next_item:
-                state.previous.append(old)
-                if len(state.previous) > 10:
-                    state.previous.pop(0)
-            while next_item:
-                try:
-                    await self.play_song(state, next_item)
-                    state.queue_preview = await queue.snapshot(chat_id)
-                    return
-                except Exception:
-                    logger.exception("Could not play queued song in %s", chat_id)
-                    delete_song_file(next_item)
-                    next_item = await queue.get_next(chat_id)
-            state.current = None
-            state.paused = False
-            state.queue_preview = []
-            try:
-                await call_py.leave_call(chat_id)
-            except Exception:
-                logger.info("No active call to leave for %s", chat_id)
+            if state.recovering:
+                return False
+            return await self._advance_locked(
+                state, expected_generation=expected_generation, force_skip=False
+            )
 
     async def skip(self, chat_id):
         state = await self.get(chat_id)
-        state.generation += 1
-        await self.next_song(chat_id)
+        async with state.lock:
+            if not state.current:
+                return False, "Nothing is playing in this group."
+            if state.recovering:
+                return False, "Playback recovery is running. Try again in a moment."
+            # Serialize manual skip with stream-end, stop, back and recovery.
+            # The short grace window filters the stream_end event caused by replacing
+            # the current stream, preventing an accidental second skip.
+            state.generation += 1
+            state.last_transition_at = time.monotonic()
+            advanced = await self._advance_locked(state, force_skip=True)
+            return advanced, ("Skipped to the next track." if state.current else "Queue finished; playback stopped.")
 
     async def stop(self, chat_id):
         state = await self.get(chat_id)
@@ -597,9 +639,12 @@ async def np_command(_, message):
 async def skip_command(_, message):
     if not await require_admin(message):
         return
-    await manager.skip(message.chat.id)
+    ok, result = await manager.skip(message.chat.id)
     state = await manager.get(message.chat.id)
-    await reply_now_playing(message, state, "⏭️ **Skipped.**\n\n" + player_card(state))
+    if not ok:
+        return await message.reply_text(result)
+    await show_player(message.chat.id, state)
+    await message.reply_text("⏭️ " + result)
 
 
 @bot_client.on_message(filters.command("pause") & filters.group)
@@ -790,7 +835,9 @@ async def control_callback(_, query):
         elif action == "resume":
             await call_py.resume(chat_id); state.paused = False
         elif action == "skip":
-            await manager.skip(chat_id)
+            ok, result = await manager.skip(chat_id)
+            if not ok:
+                return await query.answer(result, show_alert=True)
         elif action == "back":
             if not await manager.back(chat_id):
                 return await query.answer("No previous track.", show_alert=True)
@@ -818,9 +865,13 @@ def register_stream_handler():
         state = await manager.get(update.chat_id)
         if state.recovering or not state.current:
             return
+        # Ignore delayed end events generated by manual skip/reload/refresh.
+        if time.monotonic() - state.last_transition_at < 1.5:
+            return
         generation = state.generation
-        await manager.next_song(update.chat_id, expected_generation=generation)
-        await show_player(update.chat_id, state)
+        changed = await manager.next_song(update.chat_id, expected_generation=generation)
+        if changed:
+            await show_player(update.chat_id, state)
 
 
 def initialize_runtime():
