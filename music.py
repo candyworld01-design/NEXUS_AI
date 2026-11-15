@@ -35,6 +35,8 @@ call_py = None
 DOWNLOAD_DIR = "/tmp/nexus_downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="nexus-download")
+# Avoid flooding a small Render instance with simultaneous yt-dlp extractions.
+SEARCH_SEMAPHORE = asyncio.Semaphore(2)
 
 
 def ydl_options():
@@ -108,7 +110,8 @@ def _refresh_stream_sync(webpage_url):
 
 async def search_and_download(query, requester):
     loop = asyncio.get_running_loop()
-    song = await loop.run_in_executor(executor, _extract_info_sync, query)
+    async with SEARCH_SEMAPHORE:
+        song = await loop.run_in_executor(executor, _extract_info_sync, query)
     song["requester"] = requester
     song["added_at"] = time.time()
     return song
@@ -245,6 +248,9 @@ class GroupPlayer:
         self.player_message_chat_id = None
         self.recovering = False
         self.last_transition_at = 0.0
+        self.player_render_generation = 0
+        self.thumbnail_task = None
+        self.player_render_lock = asyncio.Lock()
 
 
 class PlayerManager:
@@ -476,66 +482,106 @@ async def require_admin(message):
     return True
 
 
-async def show_player(chat_id, state, target_message=None):
-    """Create one persistent player card per group, then edit it on track changes."""
-    caption = player_card(state)
-    song = state.current or {}
-    thumb = await get_thumbnail_file(song) if song.get("thumbnail") else None
-    markup = controls_keyboard(chat_id) if state.current else None
+async def _attach_player_thumbnail(chat_id, state, song, render_generation):
+    """Fetch the new track thumbnail in the background and attach it safely."""
     try:
-        if state.player_message_id:
-            if thumb:
-                try:
-                    media = InputMediaPhoto(thumb, caption=caption, parse_mode="markdown")
-                    await bot_client.edit_message_media(
-                        chat_id=state.player_message_chat_id or chat_id,
-                        message_id=state.player_message_id,
-                        media=media,
-                        reply_markup=markup,
-                    )
-                except Exception:
-                    try:
-                        await bot_client.edit_message_caption(
-                            chat_id=state.player_message_chat_id or chat_id,
-                            message_id=state.player_message_id,
-                            caption=caption,
-                            reply_markup=markup,
-                        )
-                    except Exception:
-                        try:
-                            await bot_client.delete_messages(state.player_message_chat_id or chat_id, state.player_message_id)
-                        except Exception:
-                            pass
-                        state.player_message_id = None
-            else:
-                # Telegram cannot convert a photo message into a text message by editing.
-                # Replace it only when a track has no thumbnail, keeping one visible card.
-                try:
-                    await bot_client.edit_message_text(
-                        chat_id=state.player_message_chat_id or chat_id,
-                        message_id=state.player_message_id,
-                        text=caption,
-                        reply_markup=markup,
-                        disable_web_page_preview=True,
-                    )
-                except Exception:
-                    try:
-                        await bot_client.delete_messages(state.player_message_chat_id or chat_id, state.player_message_id)
-                    except Exception:
-                        pass
-                    state.player_message_id = None
-            if state.player_message_id:
+        thumb = await get_thumbnail_file(song)
+        if not thumb:
+            return
+        async with state.player_render_lock:
+            if (
+                state.player_render_generation != render_generation
+                or state.current is not song
+                or not state.player_message_id
+            ):
                 return
-    except Exception:
-        logger.info("Existing player card unavailable; creating a new one for %s", chat_id)
-        state.player_message_id = None
 
-    if thumb:
-        sent = await bot_client.send_photo(chat_id, thumb, caption=caption, reply_markup=markup)
-    else:
-        sent = await bot_client.send_message(chat_id, caption, reply_markup=markup, disable_web_page_preview=True)
-    state.player_message_id = sent.id
-    state.player_message_chat_id = chat_id
+            old_id = state.player_message_id
+            old_chat_id = state.player_message_chat_id or chat_id
+            try:
+                await bot_client.delete_messages(old_chat_id, old_id)
+            except Exception:
+                logger.warning("Could not replace old player message in %s", chat_id)
+                return
+            state.player_message_id = None
+
+            if (
+                state.player_render_generation != render_generation
+                or state.current is not song
+            ):
+                return
+
+            try:
+                sent = await bot_client.send_photo(
+                    chat_id,
+                    thumb,
+                    caption=player_card(state),
+                    reply_markup=controls_keyboard(chat_id),
+                )
+            except Exception:
+                logger.exception("Photo player send failed for %s; keeping text card", chat_id)
+                sent = await bot_client.send_message(
+                    chat_id,
+                    player_card(state),
+                    reply_markup=controls_keyboard(chat_id),
+                    disable_web_page_preview=True,
+                )
+            state.player_message_id = sent.id
+            state.player_message_chat_id = chat_id
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Could not attach player thumbnail for %s", chat_id)
+
+
+async def show_player(chat_id, state, target_message=None):
+    """Render latest track immediately; attach the thumbnail asynchronously."""
+    async with state.player_render_lock:
+        state.player_render_generation += 1
+        render_generation = state.player_render_generation
+        song = state.current
+        caption = player_card(state)
+        markup = controls_keyboard(chat_id) if song else None
+
+        old_task = state.thumbnail_task
+        if old_task and not old_task.done():
+            old_task.cancel()
+        state.thumbnail_task = None
+
+        if state.player_message_id:
+            try:
+                await bot_client.edit_message_text(
+                    chat_id=state.player_message_chat_id or chat_id,
+                    message_id=state.player_message_id,
+                    text=caption,
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+                state.player_message_chat_id = chat_id
+            except Exception:
+                try:
+                    await bot_client.delete_messages(
+                        state.player_message_chat_id or chat_id,
+                        state.player_message_id,
+                    )
+                except Exception:
+                    pass
+                state.player_message_id = None
+
+        if not state.player_message_id:
+            sent = await bot_client.send_message(
+                chat_id,
+                caption,
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+            state.player_message_id = sent.id
+            state.player_message_chat_id = chat_id
+
+        if song and song.get("thumbnail"):
+            state.thumbnail_task = asyncio.create_task(
+                _attach_player_thumbnail(chat_id, state, song, render_generation)
+            )
 
 
 async def reply_now_playing(message, state, text=None):
@@ -813,8 +859,10 @@ async def control_callback(_, query):
             elif action == "details":
                 body = details_card(state)
             else:
-                body = player_card(state)
-            markup = screen_keyboard(chat_id, action) if action != "player" else controls_keyboard(chat_id)
+                await query.answer()
+                await show_player(chat_id, state)
+                return
+            markup = screen_keyboard(chat_id, action)
             if query.message.photo:
                 await query.message.edit_caption(caption=body, reply_markup=markup)
             else:
